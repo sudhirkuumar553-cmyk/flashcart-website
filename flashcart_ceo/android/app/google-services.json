@@ -1,0 +1,105 @@
+{
+  "project_info": {
+    "project_number": "136672836295",
+    "project_id": "sudhir2006-32c75",
+    "storage_bucket": "sudhir2006-32c75.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:136672836295:android:3124b2c4575d85dbd09ce2",
+        "android_client_info": {
+          "package_name": "com.example.flash_cart"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBn_geOuTWAdRcE6GT2T2GSSxxG6RM5Eac"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:136672836295:android:099ec4c0c4cdb423d09ce2",
+        "android_client_info": {
+          "package_name": "com.example.flashcart_admin"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBn_geOuTWAdRcE6GT2T2GSSxxG6RM5Eac"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:136672836295:android:01126fc594be7c7dd09ce2",
+        "android_client_info": {
+          "package_name": "com.example.flashcart_ceo"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBn_geOuTWAdRcE6GT2T2GSSxxG6RM5Eac"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:136672836295:android:179c4840e26fc54ad09ce2",
+        "android_client_info": {
+          "package_name": "com.example.flashcart_delivery_partner"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBn_geOuTWAdRcE6GT2T2GSSxxG6RM5Eac"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:136672836295:android:5a960bdf2282c0a3d09ce2",
+        "android_client_info": {
+          "package_name": "com.example.flashcart_manager"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBn_geOuTWAdRcE6GT2T2GSSxxG6RM5Eac"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
