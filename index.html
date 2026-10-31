@@ -5,11 +5,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-  <title>FlashCart – Online Grocery Shopping | Fruits, Vegetables & Daily Needs</title>
+  <!-- Main SEO -->
+  <title>FlashCart - Official Grocery Shopping Website | FlashCart Online</title>
 
-  <meta name="description" content="Shop groceries online with FlashCart. Explore fresh fruits, vegetables, dairy products, food staples, beverages and household essentials. Convenient online grocery shopping.">
-
-  <meta name="keywords" content="FlashCart, Flash Cart, online grocery shopping, grocery delivery, buy groceries online, online supermarket, fresh fruits online, fresh vegetables online, dairy products, milk delivery, grocery store, daily essentials, household essentials, food delivery, grocery shopping online India, online shopping India">
+  <meta name="description" content="Welcome to FlashCart, your online grocery shopping destination. Explore fresh fruits, vegetables, dairy products, groceries and everyday household essentials.">
 
   <meta name="author" content="FlashCart">
   <meta name="robots" content="index, follow, max-image-preview:large">
@@ -18,32 +17,58 @@
 
   <link rel="canonical" href="https://home.flashcarts.in/">
 
-  <!-- Open Graph SEO -->
+  <!-- Social Media Preview -->
   <meta property="og:type" content="website">
-  <meta property="og:title" content="FlashCart – Online Grocery Shopping">
-  <meta property="og:description" content="Discover groceries, fresh fruits, vegetables and daily essentials with FlashCart.">
+  <meta property="og:title" content="FlashCart - Official Grocery Shopping Website">
+  <meta property="og:description" content="Explore groceries, fresh fruits, vegetables, dairy products and daily essentials with FlashCart.">
   <meta property="og:url" content="https://home.flashcarts.in/">
   <meta property="og:site_name" content="FlashCart">
   <meta property="og:locale" content="en_IN">
 
-  <!-- Twitter SEO -->
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="FlashCart – Online Grocery Shopping">
-  <meta name="twitter:description" content="Shop groceries, fruits, vegetables and daily essentials online with FlashCart.">
+  <meta name="twitter:title" content="FlashCart - Online Grocery Shopping">
+  <meta name="twitter:description" content="Shop groceries, fruits, vegetables and everyday essentials with FlashCart.">
 
-  <!-- Structured Data for Google -->
+  <!-- Google Structured Data -->
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
-    "@type": "OnlineStore",
-    "name": "FlashCart",
-    "url": "https://home.flashcarts.in/",
-    "description": "FlashCart is an online grocery shopping platform for groceries, fruits, vegetables, dairy products and daily essentials.",
-    "currenciesAccepted": "INR",
-    "areaServed": {
-      "@type": "Country",
-      "name": "India"
-    }
+    "@graph": [
+      {
+        "@type": "Organization",
+        "@id": "https://home.flashcarts.in/#organization",
+        "name": "FlashCart",
+        "alternateName": [
+          "Flash Cart",
+          "Flashcart",
+          "FlashCart Grocery"
+        ],
+        "url": "https://home.flashcarts.in/"
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://home.flashcarts.in/#website",
+        "url": "https://home.flashcarts.in/",
+        "name": "FlashCart",
+        "alternateName": "Flash Cart",
+        "publisher": {
+          "@id": "https://home.flashcarts.in/#organization"
+        },
+        "inLanguage": "en-IN"
+      },
+      {
+        "@type": "OnlineStore",
+        "@id": "https://home.flashcarts.in/#store",
+        "name": "FlashCart",
+        "alternateName": "Flash Cart Grocery",
+        "url": "https://home.flashcarts.in/",
+        "description": "FlashCart is an online grocery shopping platform offering groceries, fresh fruits, vegetables, dairy products and everyday essentials.",
+        "currenciesAccepted": "INR",
+        "parentOrganization": {
+          "@id": "https://home.flashcarts.in/#organization"
+        }
+      }
+    ]
   }
   </script>
 
@@ -150,6 +175,11 @@
       line-height: 1.8;
     }
 
+    .about p {
+      max-width: 850px;
+      margin: auto;
+    }
+
     footer {
       background: #242424;
       color: white;
@@ -181,7 +211,7 @@
 <header>
   <div class="logo">🛒 FlashCart</div>
 
-  <nav>
+  <nav aria-label="Main navigation">
     <a href="#home">Home</a>
     <a href="#categories">Categories</a>
     <a href="#about">About</a>
@@ -192,12 +222,13 @@
 <main>
 
   <section class="hero" id="home">
-    <h1>Online Grocery Shopping Made Easy with FlashCart</h1>
+    <h1>Welcome to FlashCart - Online Grocery Shopping Made Easy</h1>
 
     <p>
-      Discover fresh fruits, vegetables, groceries, dairy products,
-      beverages and everyday household essentials with FlashCart.
-      Enjoy a convenient online grocery shopping experience.
+      FlashCart, also known as Flash Cart, is an online grocery shopping
+      platform where you can explore fresh fruits, vegetables, groceries,
+      dairy products, beverages and everyday household essentials.
+      Discover convenient everyday shopping with FlashCart.
     </p>
 
     <a class="btn" href="https://flashcarts.in/">
@@ -206,10 +237,11 @@
   </section>
 
   <section id="categories">
-    <h2>Shop Groceries by Category</h2>
+    <h2>Shop Groceries by Category at FlashCart</h2>
 
     <p style="margin-bottom:25px; line-height:1.7;">
-      Choose your favourite grocery category after logging in to FlashCart.
+      Explore grocery categories and choose your favourite products
+      after logging in to FlashCart.
     </p>
 
     <div class="grid">
@@ -252,13 +284,19 @@
   </section>
 
   <section class="about" id="about">
-    <h2>About FlashCart</h2>
+    <h2>About FlashCart - Flash Cart Grocery Shopping</h2>
 
     <p>
       FlashCart is an online grocery shopping platform designed
       to make everyday shopping simple and convenient.
-      Explore groceries, fresh fruits, vegetables, dairy products
-      and household essentials in one place.
+      Whether you search for FlashCart, Flash Cart, Flashcart Grocery
+      or FlashCart Online Shopping, this is the official FlashCart
+      homepage.
+
+      Explore groceries, fresh fruits, vegetables, dairy products,
+      beverages and household essentials in one place.
+      Visit FlashCart to discover a convenient way to shop for
+      everyday grocery needs.
     </p>
   </section>
 
@@ -270,13 +308,13 @@
   <p>For shopping and customer support, visit our online store.</p>
 
   <p>
-    Homepage:
-    <a href="https://home.flashcarts.in/">home.flashcarts.in</a>
+    Official Homepage:
+    <a href="https://home.flashcarts.in/">FlashCart</a>
   </p>
 
   <p>
     Customer Shopping:
-    <a href="https://flashcarts.in/">FlashCart Login</a>
+    <a href="https://flashcarts.in/">FlashCart Online Store</a>
   </p>
 
   <p>© 2026 FlashCart. All rights reserved.</p>
