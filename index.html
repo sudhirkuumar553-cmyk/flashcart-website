@@ -4,34 +4,183 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FlashCart | Online Grocery Shopping</title>
-  <meta name="description" content="Welcome to FlashCart. Discover groceries, fresh fruits, vegetables and daily essentials for convenient online shopping.">
-  <meta name="robots" content="index, follow">
-  <link rel="canonical" href="https://flashcarts.in/">
+
+  <title>FlashCart – Online Grocery Shopping | Fruits, Vegetables & Daily Needs</title>
+
+  <meta name="description" content="Shop groceries online with FlashCart. Explore fresh fruits, vegetables, dairy products, food staples, beverages and household essentials. Convenient online grocery shopping.">
+
+  <meta name="keywords" content="FlashCart, Flash Cart, online grocery shopping, grocery delivery, buy groceries online, online supermarket, fresh fruits online, fresh vegetables online, dairy products, milk delivery, grocery store, daily essentials, household essentials, food delivery, grocery shopping online India, online shopping India">
+
+  <meta name="author" content="FlashCart">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="googlebot" content="index, follow">
+  <meta name="theme-color" content="#ffdf35">
+
+  <link rel="canonical" href="https://home.flashcarts.in/">
+
+  <!-- Open Graph SEO -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="FlashCart – Online Grocery Shopping">
+  <meta property="og:description" content="Discover groceries, fresh fruits, vegetables and daily essentials with FlashCart.">
+  <meta property="og:url" content="https://home.flashcarts.in/">
+  <meta property="og:site_name" content="FlashCart">
+  <meta property="og:locale" content="en_IN">
+
+  <!-- Twitter SEO -->
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="FlashCart – Online Grocery Shopping">
+  <meta name="twitter:description" content="Shop groceries, fruits, vegetables and daily essentials online with FlashCart.">
+
+  <!-- Structured Data for Google -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "OnlineStore",
+    "name": "FlashCart",
+    "url": "https://home.flashcarts.in/",
+    "description": "FlashCart is an online grocery shopping platform for groceries, fruits, vegetables, dairy products and daily essentials.",
+    "currenciesAccepted": "INR",
+    "areaServed": {
+      "@type": "Country",
+      "name": "India"
+    }
+  }
+  </script>
 
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: Arial, sans-serif; color: #252525; background: #fff; }
-    header { background: #ffdf35; padding: 18px 7%; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
-    .logo { font-size: 30px; font-weight: 900; color: #222; }
-    nav a { color: #222; text-decoration: none; margin: 0 10px; font-weight: bold; }
-    .hero { background: #fff8d9; padding: 75px 8%; text-align: center; }
-    .hero h1 { font-size: clamp(32px, 5vw, 52px); margin-bottom: 18px; }
-    .hero p { font-size: 18px; line-height: 1.7; max-width: 700px; margin: auto; }
-    .btn { display: inline-block; background: #168b42; color: white; padding: 15px 32px; border-radius: 9px; text-decoration: none; font-weight: bold; margin-top: 25px; }
-    section { padding: 55px 7%; text-align: center; }
-    h2 { font-size: 30px; margin-bottom: 25px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 18px; }
-    .item { background: #fff8df; padding: 28px 12px; border-radius: 14px; font-size: 18px; font-weight: bold; }
-    .about { background: #fffbea; line-height: 1.8; }
-    footer { background: #242424; color: white; padding: 35px 7%; text-align: center; line-height: 2; }
-    footer a { color: #ffdf35; }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: Arial, sans-serif;
+      color: #252525;
+      background: #fff;
+    }
+
+    header {
+      background: #ffdf35;
+      padding: 18px 7%;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .logo {
+      font-size: 30px;
+      font-weight: 900;
+      color: #222;
+    }
+
+    nav a {
+      color: #222;
+      text-decoration: none;
+      margin: 0 10px;
+      font-weight: bold;
+    }
+
+    .hero {
+      background: #fff8d9;
+      padding: 75px 8%;
+      text-align: center;
+    }
+
+    .hero h1 {
+      font-size: clamp(32px, 5vw, 52px);
+      margin-bottom: 18px;
+    }
+
+    .hero p {
+      font-size: 18px;
+      line-height: 1.7;
+      max-width: 700px;
+      margin: auto;
+    }
+
+    .btn {
+      display: inline-block;
+      background: #168b42;
+      color: white;
+      padding: 15px 32px;
+      border-radius: 9px;
+      text-decoration: none;
+      font-weight: bold;
+      margin-top: 25px;
+    }
+
+    section {
+      padding: 55px 7%;
+      text-align: center;
+    }
+
+    h2 {
+      font-size: 30px;
+      margin-bottom: 25px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 18px;
+    }
+
+    .item {
+      display: block;
+      background: #fff8df;
+      padding: 28px 12px;
+      border-radius: 14px;
+      font-size: 18px;
+      font-weight: bold;
+      color: #252525;
+      text-decoration: none;
+      transition: 0.2s;
+    }
+
+    .item:hover {
+      background: #ffdf35;
+      transform: translateY(-4px);
+    }
+
+    .about {
+      background: #fffbea;
+      line-height: 1.8;
+    }
+
+    footer {
+      background: #242424;
+      color: white;
+      padding: 35px 7%;
+      text-align: center;
+      line-height: 2;
+    }
+
+    footer a {
+      color: #ffdf35;
+    }
+
+    @media (max-width: 600px) {
+      header {
+        justify-content: center;
+        text-align: center;
+      }
+
+      nav a {
+        display: inline-block;
+        margin: 7px;
+      }
+    }
   </style>
 </head>
+
 <body>
 
 <header>
   <div class="logo">🛒 FlashCart</div>
+
   <nav>
     <a href="#home">Home</a>
     <a href="#categories">Categories</a>
@@ -41,43 +190,95 @@
 </header>
 
 <main>
+
   <section class="hero" id="home">
-    <h1>Your Everyday Grocery Shopping Made Easy!</h1>
-    <p>Welcome to FlashCart. Explore groceries, fresh fruits, vegetables and daily essentials with a convenient online shopping experience.</p>
-    <a class="btn" href="#categories">Shop Now</a>
+    <h1>Online Grocery Shopping Made Easy with FlashCart</h1>
+
+    <p>
+      Discover fresh fruits, vegetables, groceries, dairy products,
+      beverages and everyday household essentials with FlashCart.
+      Enjoy a convenient online grocery shopping experience.
+    </p>
+
+    <a class="btn" href="https://flashcarts.in/">
+      Shop Now
+    </a>
   </section>
 
   <section id="categories">
-    <h2>Shop by Categories</h2>
+    <h2>Shop Groceries by Category</h2>
+
+    <p style="margin-bottom:25px; line-height:1.7;">
+      Choose your favourite grocery category after logging in to FlashCart.
+    </p>
+
     <div class="grid">
-      <div class="item">🥦 Fresh Vegetables</div>
-      <div class="item">🍎 Fresh Fruits</div>
-      <div class="item">🥛 Dairy Products</div>
-      <div class="item">🍚 Grocery & Staples</div>
-      <div class="item">🥤 Beverages</div>
-      <div class="item">🧼 Household Essentials</div>
+
+      <a class="item" href="https://flashcarts.in/">
+        🥦 Fresh Vegetables
+      </a>
+
+      <a class="item" href="https://flashcarts.in/">
+        🍎 Fresh Fruits
+      </a>
+
+      <a class="item" href="https://flashcarts.in/">
+        🥛 Dairy Products
+      </a>
+
+      <a class="item" href="https://flashcarts.in/">
+        🍚 Grocery & Staples
+      </a>
+
+      <a class="item" href="https://flashcarts.in/">
+        🥤 Beverages
+      </a>
+
+      <a class="item" href="https://flashcarts.in/">
+        🧼 Household Essentials
+      </a>
+
     </div>
   </section>
 
   <section>
     <h2>Why Choose FlashCart?</h2>
+
     <div class="grid">
-      <div class="item">🛍️ Easy Shopping</div>
-      <div class="item">📦 Daily Essentials</div>
+      <div class="item">🛍️ Easy Online Shopping</div>
+      <div class="item">📦 Everyday Essentials</div>
       <div class="item">🚚 Convenient Ordering</div>
     </div>
   </section>
 
   <section class="about" id="about">
     <h2>About FlashCart</h2>
-    <p>FlashCart is an online grocery shopping platform designed to make everyday shopping simple and convenient. Discover daily essentials, groceries, fruits and vegetables in one place.</p>
+
+    <p>
+      FlashCart is an online grocery shopping platform designed
+      to make everyday shopping simple and convenient.
+      Explore groceries, fresh fruits, vegetables, dairy products
+      and household essentials in one place.
+    </p>
   </section>
+
 </main>
 
 <footer id="contact">
   <h2>Contact FlashCart</h2>
+
   <p>For shopping and customer support, visit our online store.</p>
-  <p>Website: <a href="https://flashcarts.in/">flashcarts.in</a></p>
+
+  <p>
+    Homepage:
+    <a href="https://home.flashcarts.in/">home.flashcarts.in</a>
+  </p>
+
+  <p>
+    Customer Shopping:
+    <a href="https://flashcarts.in/">FlashCart Login</a>
+  </p>
+
   <p>© 2026 FlashCart. All rights reserved.</p>
 </footer>
 
