@@ -13,6 +13,7 @@ import 'package:vibration/vibration.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:http/http.dart' as http;
+import 'package:razorpay_flutter/razorpay_flutter.dart';
 
 import 'firebase_options.dart';
 
@@ -26,6 +27,10 @@ const red = Color(0xFFEF4444);
 const dark = Color(0xFF171717);
 const grey = Color(0xFF707070);
 const bg = Color(0xFFF6F7FB);
+
+// FlashCart WhatsApp OTP Cloudflare Worker. Keep this URL public; never add secrets here.
+const String whatsappOtpWorkerBaseUrl =
+    'https://throbbing-waterfall-7763.flashcartyouth553.workers.dev';
 
 InputDecoration inputDecoration(String label, IconData icon, {Widget? suffix}) {
   return InputDecoration(
@@ -1015,18 +1020,42 @@ class FlashCartDeliveryApp extends StatelessWidget {
 class DeliveryAuthGate extends StatelessWidget {
   const DeliveryAuthGate({super.key});
 
+  Future<bool> _isApprovedPartner(User user) async {
+    // Never trust Firebase sign-in alone: the Worker can issue a valid
+    // Firebase account for any phone number that successfully verifies OTP.
+    // Dashboard access requires an existing, Admin-approved application.
+    final uid = user.uid;
+    if (!uid.startsWith('phone_')) return false;
+
+    final phoneDigits = uid.substring('phone_'.length);
+    if (!RegExp(r'^91[6-9]\d{9}$').hasMatch(phoneDigits)) return false;
+
+    final db = FirebaseFirestore.instance;
+    final appSnap = await db
+        .collection('deliveryPartnerApplications')
+        .doc(phoneDigits)
+        .get();
+
+    if (!appSnap.exists) return false;
+    final app = appSnap.data() ?? <String, dynamic>{};
+    final status = (app['status'] ?? 'pending').toString().toLowerCase();
+    if (status != 'approved') return false;
+    if (app['active'] == false || app['isActive'] == false) return false;
+
+    // The login handler creates/repairs the UID-keyed partner profile after
+    // this approval check. Do not require that profile here: authStateChanges
+    // can fire before the login handler finishes writing it.
+    return true;
+  }
+
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<User?>(
       stream: FirebaseAuth.instance.authStateChanges(),
       builder: (context, snapshot) {
-        debugPrint(
-          'AUTH_STATE => user=${snapshot.data?.uid} hasData=${snapshot.hasData} connection=${snapshot.connectionState}',
-        );
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const SplashPage();
         }
-
         if (snapshot.hasError) {
           return Scaffold(
             body: Center(
@@ -1041,8 +1070,31 @@ class DeliveryAuthGate extends StatelessWidget {
           );
         }
 
-        if (snapshot.hasData) return const DeliveryDashboard();
-        return const DeliveryLoginPage();
+        final user = snapshot.data;
+        if (user == null) return const DeliveryLoginPage();
+
+        return FutureBuilder<bool>(
+          key: ValueKey(user.uid),
+          future: _isApprovedPartner(user),
+          builder: (context, approvalSnapshot) {
+            if (approvalSnapshot.connectionState != ConnectionState.done) {
+              return const SplashPage();
+            }
+
+            if (approvalSnapshot.hasError || approvalSnapshot.data != true) {
+              // Sign out after the FutureBuilder has rendered its blocked
+              // state; do not expose Dashboard during the auth-state race.
+              Future.microtask(() async {
+                if (FirebaseAuth.instance.currentUser?.uid == user.uid) {
+                  await FirebaseAuth.instance.signOut();
+                }
+              });
+              return const DeliveryLoginPage();
+            }
+
+            return const DeliveryDashboard();
+          },
+        );
       },
     );
   }
@@ -1132,147 +1184,93 @@ class _DeliveryLoginPageState extends State<DeliveryLoginPage> {
     return valueClean;
   }
 
+  Future<Map<String, dynamic>> _workerPost(
+    String path,
+    Map<String, dynamic> body,
+  ) async {
+    final response = await http
+        .post(
+          Uri.parse('$whatsappOtpWorkerBaseUrl$path'),
+          headers: const {'Content-Type': 'application/json'},
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 30));
+    Map<String, dynamic> data;
+    try {
+      data = jsonDecode(response.body) as Map<String, dynamic>;
+    } catch (_) {
+      throw Exception(
+        'OTP server से गलत response मिला (${response.statusCode})',
+      );
+    }
+    if (response.statusCode < 200 ||
+        response.statusCode >= 300 ||
+        data['ok'] != true) {
+      throw Exception(
+        (data['error'] ?? data['message'] ?? 'OTP request failed').toString(),
+      );
+    }
+    return data;
+  }
+
+  String _phoneDigits(String value) => value.replaceAll(RegExp(r'\D'), '');
+
   Future<void> sendOtp() async {
     FocusScope.of(context).unfocus();
-
     final number = normalizeIndianPhone(phone.text);
-
     if (!RegExp(r'^\+91[6-9]\d{9}$').hasMatch(number)) {
       message('Valid 10 digit Indian mobile number डालें');
       return;
     }
-
-    setState(() => loading = true);
-
+    setState(() {
+      loading = true;
+      codeSent = false;
+    });
     try {
-      await FirebaseAuth.instance.verifyPhoneNumber(
-        phoneNumber: number,
-        timeout: const Duration(seconds: 60),
-        forceResendingToken: resendToken,
-
-        verificationCompleted: (PhoneAuthCredential credential) async {
-          if (_authBusy) return;
-
-          _authBusy = true;
-          try {
-            final result = await FirebaseAuth.instance.signInWithCredential(
-              credential,
-            );
-            await authorizePartner(result.user);
-          } on FirebaseAuthException catch (e) {
-            if (mounted)
-              message('Automatic OTP login failed: ${e.message ?? e.code}');
-          } catch (e) {
-            if (mounted) message('Login error: $e');
-          } finally {
-            _authBusy = false;
-            if (mounted) setState(() => loading = false);
-          }
-        },
-
-        verificationFailed: (FirebaseAuthException e) {
-          if (!mounted) return;
-
-          setState(() => loading = false);
-
-          var text = 'OTP भेजा नहीं जा सका';
-
-          switch (e.code) {
-            case 'invalid-phone-number':
-              text = 'Mobile number सही नहीं है';
-              break;
-            case 'too-many-requests':
-              text = 'बहुत ज्यादा attempts हुए हैं। थोड़ी देर बाद कोशिश करें';
-              break;
-            case 'quota-exceeded':
-              text = 'Firebase SMS quota समाप्त हो गया है';
-              break;
-            case 'operation-not-allowed':
-              text = 'Firebase Console में Phone Authentication enable करें';
-              break;
-            default:
-              if (e.message != null && e.message!.isNotEmpty) {
-                text = e.message!;
-              }
-          }
-
-          message(text);
-        },
-
-        codeSent: (String id, int? token) {
-          if (!mounted) return;
-
-          setState(() {
-            verificationId = id;
-            resendToken = token;
-            codeSent = true;
-            loading = false;
-          });
-
-          message('OTP आपके mobile number पर भेज दिया गया है');
-        },
-
-        codeAutoRetrievalTimeout: (String id) {
-          verificationId = id;
-        },
-      );
+      await _workerPost('/auth/send-otp', {'phone': _phoneDigits(number)});
+      if (!mounted) return;
+      setState(() {
+        codeSent = true;
+        loading = false;
+      });
+      message('WhatsApp पर OTP भेज दिया गया है');
     } catch (e) {
       if (!mounted) return;
       setState(() => loading = false);
-      message('OTP error: $e');
+      message('WhatsApp OTP नहीं भेजा गया: $e');
     }
   }
 
   Future<void> verifyOtp() async {
     FocusScope.of(context).unfocus();
-
+    final number = normalizeIndianPhone(phone.text);
+    final digits = _phoneDigits(number);
     final code = otp.text.trim();
-
-    if (verificationId == null) {
-      message('पहले OTP भेजें');
+    if (!codeSent) {
+      message('पहले WhatsApp OTP भेजें');
       return;
     }
-
     if (!RegExp(r'^\d{6}$').hasMatch(code)) {
       message('6 digit OTP डालें');
       return;
     }
-
     if (_authBusy) return;
     _authBusy = true;
     setState(() => loading = true);
-
     try {
-      final credential = PhoneAuthProvider.credential(
-        verificationId: verificationId!,
-        smsCode: code,
+      final result = await _workerPost('/auth/verify-otp', {
+        'phone': digits,
+        'otp': code,
+      });
+      final customToken = (result['firebaseCustomToken'] ?? '').toString();
+      if (customToken.isEmpty)
+        throw Exception('Firebase Custom Token response में नहीं मिला');
+      final credential = await FirebaseAuth.instance.signInWithCustomToken(
+        customToken,
       );
-
-      final result = await FirebaseAuth.instance.signInWithCredential(
-        credential,
-      );
-
-      await authorizePartner(result.user);
+      await authorizePartner(credential.user);
     } on FirebaseAuthException catch (e) {
-      var text = 'OTP verification failed';
-
-      switch (e.code) {
-        case 'invalid-verification-code':
-          text = 'OTP गलत है';
-          break;
-        case 'session-expired':
-          text = 'OTP expire हो गया। नया OTP भेजें';
-          break;
-        case 'credential-already-in-use':
-          text = 'यह mobile number किसी दूसरे account से जुड़ा है';
-          break;
-        default:
-          if (e.message != null && e.message!.isNotEmpty) {
-            text = e.message!;
-          }
-      }
-
-      message(text);
+      message('Firebase login failed: ${e.message ?? e.code}');
     } catch (e) {
       message('Login error: $e');
     } finally {
@@ -1282,219 +1280,82 @@ class _DeliveryLoginPageState extends State<DeliveryLoginPage> {
   }
 
   Future<void> authorizePartner(User? firebaseUser) async {
-    if (firebaseUser == null) {
+    if (firebaseUser == null)
       throw FirebaseAuthException(
         code: 'missing-user',
         message: 'Firebase user account नहीं मिला',
       );
-    }
-
     final uid = firebaseUser.uid;
-    final partnerRef = FirebaseFirestore.instance
-        .collection('deliveryPartners')
-        .doc(uid);
-
-    // Normal case: Admin has already created the partner document
-    // using the Firebase Authentication UID.
-    final direct = await partnerRef.get();
-    debugPrint(
-      'PARTNER_CHECK => uid=$uid exists=${direct.exists} data=${direct.data()}',
-    );
-
-    if (direct.exists) {
-      await finishPartnerLogin(
-        firebaseUser,
-        partnerRef,
-        direct.data() ?? <String, dynamic>{},
-      );
-      return;
-    }
-
-    // Compatibility case: older partner documents may have been created
-    // with an auto-ID while storing the partner phone number.
-    final phoneNumber = firebaseUser.phoneNumber;
-    if (phoneNumber == null || phoneNumber.isEmpty) {
-      debugPrint('AUTO_SIGNOUT => missing Firebase phone number');
+    // Worker UID format: phone_91XXXXXXXXXX. It gives us the verified phone
+    // without relying on Firebase phone_number claims.
+    if (!uid.startsWith('phone_')) {
       await FirebaseAuth.instance.signOut();
-      message('Partner mobile number Firebase में नहीं मिला');
+      message('यह WhatsApp OTP account मान्य नहीं है');
       return;
     }
-
-    // If Admin approved the application before this phone ever signed in,
-    // Firebase Phone Auth creates the Auth user on successful OTP verification.
-    // Build the partner profile under that new Firebase UID from the approved
-    // application so login works without the Admin app being open.
-    try {
-      final approved = await FirebaseFirestore.instance
-          .collection('deliveryPartnerApplications')
-          .where('phone', isEqualTo: phoneNumber)
-          .where('status', isEqualTo: 'approved')
-          .limit(1)
-          .get();
-
-      if (approved.docs.isNotEmpty) {
-        final appDoc = approved.docs.first;
-        final appData = Map<String, dynamic>.from(appDoc.data());
-
-        // Preserve the branch assigned by Admin when the partner was approved.
-        // Older profiles may use an auto-ID, so locate the approved profile by
-        // phone before migrating it to the Firebase Auth UID document.
-        Map<String, dynamic> existingPartnerData = <String, dynamic>{};
-        String? existingPartnerDocId;
-        final localPhone = phoneNumber.startsWith('+91')
-            ? phoneNumber.substring(3)
-            : phoneNumber;
-        final phoneCandidates = <String>{
-          phoneNumber,
-          localPhone,
-          '0$localPhone',
-        };
-        for (final field in ['phone', 'mobile', 'mobileNumber']) {
-          for (final value in phoneCandidates) {
-            final existing = await FirebaseFirestore.instance
-                .collection('deliveryPartners')
-                .where(field, isEqualTo: value)
-                .limit(1)
-                .get();
-            final match = existing.docs.where((doc) => doc.id != uid).toList();
-            if (match.isNotEmpty) {
-              existingPartnerData = Map<String, dynamic>.from(
-                match.first.data(),
-              );
-              existingPartnerDocId = match.first.id;
-              break;
-            }
-          }
-          if (existingPartnerData.isNotEmpty) break;
-        }
-
-        final migrated = <String, dynamic>{
-          ...appData,
-          ...existingPartnerData,
-          'name':
-              existingPartnerData['name'] ??
-              appData['name'] ??
-              appData['fullName'] ??
-              'Delivery Partner',
-          'phone': phoneNumber,
-          'mobile':
-              existingPartnerData['mobile'] ?? appData['mobile'] ?? localPhone,
-          'mobileNumber':
-              existingPartnerData['mobileNumber'] ??
-              appData['mobileNumber'] ??
-              localPhone,
-          'vehicle': existingPartnerData['vehicle'] ?? appData['vehicle'] ?? '',
-          'vehicleNumber':
-              existingPartnerData['vehicleNumber'] ??
-              appData['vehicleNumber'] ??
-              '',
-          'area': existingPartnerData['area'] ?? appData['area'] ?? '',
-          // Never replace an already assigned branch with an empty value.
-          if ((existingPartnerData['branchId'] ?? appData['branchId'] ?? '')
-              .toString()
-              .trim()
-              .isNotEmpty)
-            'branchId': existingPartnerData['branchId'] ?? appData['branchId'],
-          if ((existingPartnerData['branchName'] ?? appData['branchName'] ?? '')
-              .toString()
-              .trim()
-              .isNotEmpty)
-            'branchName':
-                existingPartnerData['branchName'] ?? appData['branchName'],
-          'active': existingPartnerData['active'] ?? true,
-          'online': false,
-          'availableForOrder': false,
-          'authUid': uid,
-          'applicationId': appDoc.id,
-          if (existingPartnerDocId != null && existingPartnerDocId != uid)
-            'migratedFrom': existingPartnerDocId,
-          'approvedAt':
-              existingPartnerData['approvedAt'] ??
-              appData['reviewedAt'] ??
-              FieldValue.serverTimestamp(),
-          'createdAt':
-              existingPartnerData['createdAt'] ??
-              appData['createdAt'] ??
-              FieldValue.serverTimestamp(),
-          'updatedAt': FieldValue.serverTimestamp(),
-        };
-        await partnerRef.set(migrated, SetOptions(merge: true));
-        await finishPartnerLogin(firebaseUser, partnerRef, migrated);
-        message(
-          'Registration approved — Firebase account ready. Login successful ✅',
-        );
-        return;
-      }
-    } on FirebaseException catch (e) {
-      debugPrint('APPROVED_APPLICATION_LOOKUP => ${e.code}: ${e.message}');
+    final phoneDigits = uid.substring('phone_'.length);
+    if (!RegExp(r'^91[6-9]\d{9}$').hasMatch(phoneDigits)) {
+      await FirebaseAuth.instance.signOut();
+      message('Verified mobile number सही नहीं है');
+      return;
     }
-
-    final localNumber = phoneNumber.startsWith('+91')
-        ? phoneNumber.substring(3)
-        : phoneNumber;
-
-    final candidatePhones = <String>{
-      phoneNumber,
-      localNumber,
-      '0$localNumber',
-    }.toList();
-
-    QuerySnapshot<Map<String, dynamic>>? found;
-
-    for (final field in ['phone', 'mobile', 'mobileNumber']) {
-      for (final value in candidatePhones) {
-        try {
-          final result = await FirebaseFirestore.instance
-              .collection('deliveryPartners')
-              .where(field, isEqualTo: value)
-              .limit(1)
-              .get();
-
-          if (result.docs.isNotEmpty) {
-            found = result;
-            break;
-          }
-        } catch (_) {
-          // Try the next supported field/format.
-        }
-      }
-
-      if (found != null) break;
+    final phoneNumber = '+$phoneDigits';
+    final db = FirebaseFirestore.instance;
+    final applicationRef = db
+        .collection('deliveryPartnerApplications')
+        .doc(phoneDigits);
+    final application = await applicationRef.get();
+    if (!application.exists) {
+      await FirebaseAuth.instance.signOut();
+      message('इस नंबर से Registration नहीं मिला। पहले Registration करें।');
+      return;
     }
-
-    if (found == null || found.docs.isEmpty) {
-      debugPrint('AUTO_SIGNOUT => partner profile not found');
+    final appData = Map<String, dynamic>.from(application.data() ?? {});
+    final status = (appData['status'] ?? 'pending').toString().toLowerCase();
+    if (status != 'approved') {
       await FirebaseAuth.instance.signOut();
       message(
-        'Delivery Partner profile नहीं मिला। Firebase में deliveryPartners का document ID उसी Firebase Auth UID से होना चाहिए.',
+        status == 'rejected'
+            ? 'आपकी Registration Reject हुई है। Admin से संपर्क करें।'
+            : 'आपकी Registration अभी Admin Approval में है। Approval के बाद Login करें।',
       );
       return;
     }
-
-    final oldDoc = found.docs.first;
-    final data = Map<String, dynamic>.from(oldDoc.data());
-
-    if (data['active'] == false) {
-      debugPrint('AUTO_SIGNOUT => partner inactive, data=$data');
-      debugPrint('AUTO_SIGNOUT => finishPartnerLogin inactive, data=$data');
+    if (appData['active'] == false || appData['isActive'] == false) {
       await FirebaseAuth.instance.signOut();
       message('आपका Delivery Partner account inactive है');
       return;
     }
 
-    // Copy the existing partner profile to the Firebase Auth UID.
-    // This keeps the rest of this app's order/earning queries working,
-    // because they use FirebaseAuth.currentUser.uid.
-    data['phone'] = phoneNumber;
-    data['authUid'] = uid;
-    data['applicationId'] = data['applicationId'] ?? oldDoc.id;
-    data['migratedFrom'] = oldDoc.id;
-    data['updatedAt'] = FieldValue.serverTimestamp();
-
-    await partnerRef.set(data, SetOptions(merge: true));
-
-    if (!mounted) return;
-    message('Login successful');
+    final partnerRef = db.collection('deliveryPartners').doc(uid);
+    final current = await partnerRef.get();
+    final oldData = current.data() ?? <String, dynamic>{};
+    final profile = <String, dynamic>{
+      ...appData,
+      ...oldData,
+      'name': oldData['name'] ?? appData['name'] ?? 'Delivery Partner',
+      'phone': phoneNumber,
+      'mobile':
+          oldData['mobile'] ?? appData['mobile'] ?? phoneDigits.substring(2),
+      'mobileNumber':
+          oldData['mobileNumber'] ??
+          appData['mobileNumber'] ??
+          phoneDigits.substring(2),
+      'authUid': uid,
+      'applicationId': application.id,
+      'active': oldData['active'] ?? appData['active'] ?? true,
+      'online': oldData['online'] ?? false,
+      'availableForOrder': oldData['availableForOrder'] ?? false,
+      'approvedAt':
+          appData['reviewedAt'] ??
+          appData['approvedAt'] ??
+          oldData['approvedAt'] ??
+          FieldValue.serverTimestamp(),
+      'updatedAt': FieldValue.serverTimestamp(),
+    };
+    await partnerRef.set(profile, SetOptions(merge: true));
+    await finishPartnerLogin(firebaseUser, partnerRef, profile);
+    if (mounted) message('Login successful ✅');
   }
 
   Future<void> finishPartnerLogin(
@@ -1980,7 +1841,7 @@ class _DeliveryPartnerRegistrationPageState
             style: TextStyle(fontWeight: FontWeight.w900),
           ),
           content: const Text(
-            'आपकी Delivery Partner registration request Admin को भेज दी गई है। Approval के बाद इसी mobile number से OTP login करें।',
+            'आपकी Delivery Partner registration request Admin को भेज दी गई है। Admin Approval केवल एक बार होगा। Approval के बाद हर बार WhatsApp OTP से Login कर सकेंगे।',
             textAlign: TextAlign.center,
           ),
           actions: [
@@ -2077,7 +1938,7 @@ class _DeliveryPartnerRegistrationPageState
                         ),
                         SizedBox(height: 4),
                         Text(
-                          'Registration → Admin Approval → OTP Login',
+                          'One-time Admin Approval → WhatsApp OTP Login',
                           style: TextStyle(color: Colors.white70),
                         ),
                       ],
@@ -2365,7 +2226,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard> {
   @override
   void initState() {
     super.initState();
-    tab = widget.initialTab.clamp(0, 3).toInt();
+    tab = widget.initialTab.clamp(0, 5).toInt();
   }
 
   final pages = const [
@@ -2374,6 +2235,7 @@ class _DeliveryDashboardState extends State<DeliveryDashboard> {
     EarningsPage(),
     PartnerProfilePage(),
     PartnerBankDetailsPage(),
+    const PartnerKitAndCodPage(),
   ];
 
   Future<void> logout() async {
@@ -2656,6 +2518,11 @@ class _DeliveryDashboardState extends State<DeliveryDashboard> {
                   color: orange,
                 ),
                 label: 'Bank',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.inventory_2_outlined),
+                selectedIcon: Icon(Icons.inventory_2_rounded, color: orange),
+                label: 'Kit & COD',
               ),
             ],
           ),
@@ -7971,6 +7838,557 @@ class _PartnerBankDetailsPageState extends State<PartnerBankDetailsPage> {
                 ),
               ),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================
+// DELIVERY PARTNER RAZORPAY DEPOSIT, KIT DUES & DEDUCTION RECEIPTS
+// ============================================================
+const String _partnerPaymentBaseUrl = 'https://run.app';
+
+class PartnerKitAndCodPage extends StatefulWidget {
+  const PartnerKitAndCodPage({super.key});
+  @override
+  State<PartnerKitAndCodPage> createState() => _PartnerKitAndCodPageState();
+}
+
+class _PartnerKitAndCodPageState extends State<PartnerKitAndCodPage> {
+  final codAmount = TextEditingController();
+  late final Razorpay _razorpay;
+  bool busy = false;
+  String? _activeOrderId;
+  double _activeAmount = 0;
+  String _activePaymentType = 'COD_DEPOSIT';
+  @override
+  void initState() {
+    super.initState();
+    _razorpay = Razorpay();
+    _razorpay.on(Razorpay.EVENT_PAYMENT_SUCCESS, _handlePaymentSuccess);
+    _razorpay.on(Razorpay.EVENT_PAYMENT_ERROR, _handlePaymentError);
+    _razorpay.on(Razorpay.EVENT_EXTERNAL_WALLET, (_) {});
+  }
+
+  @override
+  void dispose() {
+    _razorpay.clear();
+    codAmount.dispose();
+    super.dispose();
+  }
+
+  Future<Map<String, dynamic>> _callPaymentApi(
+    String path,
+    Map<String, dynamic> body,
+  ) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) throw Exception('कृपया दोबारा Login करें।');
+    final token = await user.getIdToken(true);
+    final res = await http
+        .post(
+          Uri.parse('$_partnerPaymentBaseUrl$path'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $token',
+          },
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 30));
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    if (res.statusCode < 200 || res.statusCode >= 300 || data['ok'] != true) {
+      throw Exception((data['error'] ?? 'Payment server error').toString());
+    }
+    return data;
+  }
+
+  Future<void> _startRazorpayPayment({
+    required double amount,
+    required String paymentType,
+    required String description,
+    List<String> deductionIds = const [],
+  }) async {
+    if (amount < 1) {
+      _snack('कम से कम ₹1 दर्ज करें।', isError: true);
+      return;
+    }
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+    setState(() => busy = true);
+    try {
+      final session = await _callPaymentApi('/partner/deposit-session', {
+        'amount': amount,
+        'paymentType': paymentType,
+        'deductionIds': deductionIds,
+      });
+      _activeOrderId = session['razorpayOrderId'].toString();
+      _activeAmount = amount;
+      _activePaymentType = paymentType;
+      final options = {
+        'key': session['keyId'].toString(),
+        'amount': session['amount'],
+        'order_id': _activeOrderId,
+        'name': 'FlashCart Partner',
+        'description': description,
+        'prefill': {'contact': user.phoneNumber ?? ''},
+        'theme': {'color': '#FF6B35'},
+      };
+      _razorpay.open(options);
+    } catch (e) {
+      if (mounted) {
+        setState(() => busy = false);
+        _snack('Razorpay शुरू नहीं हो सका: $e', isError: true);
+      }
+    }
+  }
+
+  Future<void> _handlePaymentSuccess(PaymentSuccessResponse response) async {
+    try {
+      await _callPaymentApi('/partner/deposit-verify', {
+        'razorpayOrderId': response.orderId ?? _activeOrderId,
+        'razorpayPaymentId': response.paymentId,
+        'razorpaySignature': response.signature,
+      });
+      if (_activePaymentType == 'COD_DEPOSIT') codAmount.clear();
+      if (mounted)
+        _snack(
+          '₹${_activeAmount.toStringAsFixed(0)} का Razorpay भुगतान सफल रहा! ✅',
+        );
+    } catch (e) {
+      if (mounted) _snack('Payment verify त्रुटि: $e', isError: true);
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  void _handlePaymentError(PaymentFailureResponse response) {
+    if (!mounted) return;
+    setState(() => busy = false);
+    _snack(
+      'Payment रद्द या असफल: ${response.message ?? 'कृपया पुनः प्रयास करें'}',
+      isError: true,
+    );
+  }
+
+  void _snack(String msg, {bool isError = false}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: isError ? red : green,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null)
+      return const Scaffold(body: Center(child: Text('Please login again.')));
+    final uid = user.uid;
+    final db = FirebaseFirestore.instance;
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: AppBar(
+        title: const Text(
+          'COD Deposit & Fee Cut Details',
+          style: TextStyle(fontWeight: FontWeight.w900),
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: db
+                .collection('partnerRecoveryLedger')
+                .where('partnerUid', isEqualTo: uid)
+                .snapshots(),
+            builder: (context, snap) {
+              final allDocs = snap.data?.docs ?? [];
+              final pendingDocs = allDocs
+                  .where((d) => (d.data()['status'] ?? 'pending') == 'pending')
+                  .toList();
+              final totalDue = pendingDocs.fold<double>(
+                0,
+                (sum, d) => sum + moneyFrom(d.data()['amount']),
+              );
+              return Container(
+                margin: const EdgeInsets.only(bottom: 14),
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: totalDue > 0
+                        ? red.withValues(alpha: .35)
+                        : green.withValues(alpha: .35),
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        CircleAvatar(
+                          backgroundColor: totalDue > 0
+                              ? red.withValues(alpha: .12)
+                              : green.withValues(alpha: .12),
+                          child: Icon(
+                            Icons.receipt_long_rounded,
+                            color: totalDue > 0 ? red : green,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                'Kit & Fee Deductions (कटौती विवरण)',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                              Text(
+                                totalDue > 0
+                                    ? 'कुल बकाया कटौती: ₹${totalDue.toStringAsFixed(0)}'
+                                    : 'कोई बकाया फीस नहीं है ✅',
+                                style: TextStyle(
+                                  color: totalDue > 0 ? red : green,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (pendingDocs.isNotEmpty) ...[
+                      const Divider(height: 22),
+                      const Text(
+                        'किस कारण से पैसा कटेगा / बकाया है:',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: grey,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      ...pendingDocs.map((doc) {
+                        final item = doc.data();
+                        final reason = (item['reason'] ?? 'Kit Fee').toString();
+                        final note = (item['note'] ?? '').toString().trim();
+                        final byRole = (item['addedByRole'] ?? 'Admin')
+                            .toString();
+                        final amt = moneyFrom(item['amount']);
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          padding: const EdgeInsets.all(11),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFFFF5F5),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      reason,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w900,
+                                      ),
+                                    ),
+                                    if (note.isNotEmpty)
+                                      Text(
+                                        note,
+                                        style: const TextStyle(
+                                          fontSize: 12,
+                                          color: dark,
+                                        ),
+                                      ),
+                                    Text(
+                                      'Added by: $byRole',
+                                      style: const TextStyle(
+                                        fontSize: 11,
+                                        color: grey,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              Text(
+                                '- ₹${amt.toStringAsFixed(0)}',
+                                style: const TextStyle(
+                                  color: red,
+                                  fontWeight: FontWeight.w900,
+                                  fontSize: 16,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      }),
+                      const SizedBox(height: 8),
+                      SizedBox(
+                        width: double.infinity,
+                        height: 48,
+                        child: FilledButton.icon(
+                          onPressed: busy
+                              ? null
+                              : () => _startRazorpayPayment(
+                                  amount: totalDue,
+                                  paymentType: 'KIT_FEE_DEPOSIT',
+                                  description: 'FlashCart Kit & Fee Dues',
+                                  deductionIds: pendingDocs
+                                      .map((e) => e.id)
+                                      .toList(),
+                                ),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: orange,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                          ),
+                          icon: const Icon(Icons.payment_rounded),
+                          label: Text(
+                            'Pay ₹${totalDue.toStringAsFixed(0)} Fee via Razorpay',
+                            style: const TextStyle(fontWeight: FontWeight.w900),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              );
+            },
+          ),
+          Container(
+            margin: const EdgeInsets.only(bottom: 14),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Deposit COD Cash via Razorpay',
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'कस्टमर से लिया गया COD कैश UPI/Card से कंपनी में जमा करें।',
+                  style: TextStyle(color: grey, fontSize: 12),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: codAmount,
+                  enabled: !busy,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  decoration: inputDecoration(
+                    'COD Cash Amount (₹)',
+                    Icons.currency_rupee_rounded,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  height: 50,
+                  child: FilledButton.icon(
+                    onPressed: busy
+                        ? null
+                        : () {
+                            final val =
+                                double.tryParse(codAmount.text.trim()) ?? 0;
+                            _startRazorpayPayment(
+                              amount: val,
+                              paymentType: 'COD_DEPOSIT',
+                              description: 'FlashCart COD Cash Deposit',
+                            );
+                          },
+                    style: FilledButton.styleFrom(
+                      backgroundColor: green,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    icon: busy
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Icon(Icons.account_balance_wallet_rounded),
+                    label: Text(
+                      busy ? 'Processing...' : 'Deposit Cash via Razorpay',
+                      style: const TextStyle(fontWeight: FontWeight.w900),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 6),
+            child: Text(
+              'Payment & Deduction History (पूरा हिसाब)',
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
+            ),
+          ),
+          StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: db
+                .collection('partnerPaymentReceipts')
+                .where('partnerUid', isEqualTo: uid)
+                .snapshots(),
+            builder: (context, snap) {
+              if (!snap.hasData)
+                return const Center(child: CircularProgressIndicator());
+              final docs = [...snap.data!.docs];
+              docs.sort((a, b) {
+                final at =
+                    timestampFrom(a.data()['createdAt'])
+                        ?.millisecondsSinceEpoch ??
+                    0;
+                final bt =
+                    timestampFrom(b.data()['createdAt'])
+                        ?.millisecondsSinceEpoch ??
+                    0;
+                return bt.compareTo(at);
+              });
+              if (docs.isEmpty) {
+                return Container(
+                  padding: const EdgeInsets.all(18),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: const Text(
+                    'अभी तक कोई Razorpay जमा या कटौती रसीद नहीं है।',
+                    style: TextStyle(color: grey),
+                  ),
+                );
+              }
+              return Column(
+                children: docs.map((doc) {
+                  final r = doc.data();
+                  final type = (r['paymentType'] ?? '').toString();
+                  final net = moneyFrom(r['netAmount'] ?? r['grossAmount']);
+                  final gross = moneyFrom(r['grossAmount']);
+                  final cut = moneyFrom(r['deductedAmount']);
+                  final payId = (r['razorpayPaymentId'] ?? '').toString();
+                  final dt = timestampFrom(r['createdAt']);
+                  final breakdown = r['breakdown'] is List
+                      ? List<Map<String, dynamic>>.from(
+                          (r['breakdown'] as List).whereType<Map>().map(
+                            (e) => Map<String, dynamic>.from(e),
+                          ),
+                        )
+                      : <Map<String, dynamic>>[];
+                  final title = type == 'COD_DEPOSIT'
+                      ? 'COD Cash Deposited (Razorpay)'
+                      : type == 'KIT_FEE_DEPOSIT'
+                      ? 'Kit / Fee Paid (Razorpay)'
+                      : 'Payout Settlement';
+                  return Container(
+                    margin: const EdgeInsets.only(bottom: 10),
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                title,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                            ),
+                            Text(
+                              '₹${net.toStringAsFixed(0)}',
+                              style: const TextStyle(
+                                color: green,
+                                fontWeight: FontWeight.w900,
+                                fontSize: 17,
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (cut > 0) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            'कुल राशि: ₹${gross.toStringAsFixed(0)}  |  कटौती: -₹${cut.toStringAsFixed(0)}',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: red,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
+                        if (breakdown.isNotEmpty) ...[
+                          const Divider(height: 14),
+                          const Text(
+                            'कटौती / फीस विवरण:',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: grey,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          ...breakdown.map((b) {
+                            final bReason = (b['reason'] ?? 'Fee').toString();
+                            final bRole = (b['addedByRole'] ?? '').toString();
+                            final bAmt = moneyFrom(b['amount']);
+                            return Padding(
+                              padding: const EdgeInsets.only(top: 2),
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      '• $bReason ${bRole.isNotEmpty ? '($bRole)' : ''}',
+                                      style: const TextStyle(fontSize: 12),
+                                    ),
+                                  ),
+                                  Text(
+                                    '₹${bAmt.toStringAsFixed(0)}',
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          }),
+                        ],
+                        const SizedBox(height: 6),
+                        Text(
+                          '${payId.isNotEmpty ? 'ID: $payId • ' : ''}${dt != null ? dt.toLocal().toString().substring(0, 16) : ''}',
+                          style: const TextStyle(fontSize: 11, color: grey),
+                        ),
+                      ],
+                    ),
+                  );
+                }).toList(),
+              );
+            },
           ),
         ],
       ),

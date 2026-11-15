@@ -514,6 +514,7 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
     CeoWeeklyPayoutCommissionPage(),
     DeliveryPartnerEarningsPage(),
     CeoPartnerBankVerificationPage(),
+    const CeoFinanceControlPage(),
   ];
 
   final titles = [
@@ -541,6 +542,7 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
     'Weekly Payout & Admin Incentives',
     'Delivery Partner Earnings & Payments',
     'Bank Details & Verification',
+    'Kit Recovery, COD & Admin Finance',
   ];
 
   StreamSubscription<QuerySnapshot>? _orderSubscription;
@@ -832,6 +834,11 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
                     23,
                     Icons.account_balance_rounded,
                     'Bank Details & Verification',
+                  ),
+                  drawerItem(
+                    24,
+                    Icons.payments_rounded,
+                    'Kit Recovery, COD & Admin Finance',
                   ),
                   const SizedBox(height: 12),
                 ],
@@ -3930,6 +3937,116 @@ class DeliveryPartnersPage extends StatelessWidget {
     return 'XXXX XXXX ${digits.substring(8)}';
   }
 
+  Future<void> _showAddFeeDialog(
+    BuildContext context,
+    String partnerUid,
+    String partnerName,
+    String branchId,
+  ) async {
+    String selectedFee = 'T-Shirt Fee';
+    final options = ['T-Shirt Fee', 'Delivery Bag Fee', 'Cap Fee', 'Other Fee'];
+    final amountCtrl = TextEditingController();
+    final noteCtrl = TextEditingController();
+    bool saving = false;
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          title: const Text(
+            'Add Fee / Cut (CEO)',
+            style: TextStyle(fontWeight: FontWeight.w900),
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Partner: $partnerName',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: options
+                      .map(
+                        (opt) => ChoiceChip(
+                          label: Text(opt),
+                          selected: selectedFee == opt,
+                          onSelected: (_) => setLocal(() => selectedFee = opt),
+                        ),
+                      )
+                      .toList(),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: amountCtrl,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  decoration: const InputDecoration(
+                    labelText: 'Amount (₹)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: noteCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Reason / Note (Optional)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: saving ? null : () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: saving
+                  ? null
+                  : () async {
+                      final amt = double.tryParse(amountCtrl.text.trim()) ?? 0;
+                      if (amt <= 0) return;
+                      setLocal(() => saving = true);
+                      await FirebaseFirestore.instance
+                          .collection('partnerRecoveryLedger')
+                          .add({
+                            'partnerUid': partnerUid,
+                            'partnerName': partnerName,
+                            'branchId': branchId,
+                            'reason': selectedFee,
+                            'note': noteCtrl.text.trim(),
+                            'amount': amt,
+                            'status': 'pending',
+                            'addedByRole': 'CEO',
+                            'addedByUid':
+                                FirebaseAuth.instance.currentUser?.uid ?? '',
+                            'createdAt': FieldValue.serverTimestamp(),
+                          });
+                      if (ctx.mounted) {
+                        Navigator.pop(ctx);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text(
+                              '₹${amt.toStringAsFixed(0)} ($selectedFee) CEO द्वारा जोड़ दिया गया ✅',
+                            ),
+                          ),
+                        );
+                      }
+                    },
+              child: Text(saving ? 'Saving...' : 'Add Fee'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
@@ -4230,8 +4347,20 @@ class DeliveryPartnersPage extends StatelessWidget {
                                   transferPartner(context, doc.id, data);
                                 if (action == 'delete')
                                   deleteUnusedPartner(context, doc.id, data);
+                                if (action == 'add_fee')
+                                  _showAddFeeDialog(
+                                    context,
+                                    doc.id,
+                                    name,
+                                    (data['branchId'] ?? '').toString(),
+                                  );
                               },
                               itemBuilder: (_) => [
+                                const PopupMenuItem(
+                                  value: 'add_fee',
+                                  child: Text('Add Fee / Cut (₹)'),
+                                ),
+
                                 PopupMenuItem(
                                   value: 'active',
                                   child: Text(
@@ -9243,6 +9372,506 @@ class _DeliveryPartnerEarningsPageState
           },
         ),
       ],
+    );
+  }
+}
+
+// ============================================================
+// FLASHCART FINANCE CONTROL (CEO)
+// New finance collections are isolated from existing order/earnings records.
+// ============================================================
+class CeoFinanceControlPage extends StatefulWidget {
+  const CeoFinanceControlPage({super.key});
+  @override
+  State<CeoFinanceControlPage> createState() => _CeoFinanceControlPageState();
+}
+
+class _CeoFinanceControlPageState extends State<CeoFinanceControlPage> {
+  final partnerUid = TextEditingController();
+  final kitName = TextEditingController(text: 'Delivery Kit');
+  final kitPrice = TextEditingController();
+  final fixedRecovery = TextEditingController();
+  final percentRecovery = TextEditingController();
+  final maxRecovery = TextEditingController();
+  final recoveryAmount = TextEditingController();
+  final recoveryReason = TextEditingController();
+  final branchId = TextEditingController();
+  final monthlyAdminAmount = TextEditingController();
+  final codDeadline = TextEditingController(text: '19:00');
+  final razorpayKeyId = TextEditingController();
+  final razorpaySecret = TextEditingController();
+  String kitPolicy = 'mixed';
+  String recoveryMode = 'both';
+  bool busy = false;
+
+  @override
+  void dispose() {
+    for (final c in [
+      partnerUid,
+      kitName,
+      kitPrice,
+      fixedRecovery,
+      percentRecovery,
+      maxRecovery,
+      recoveryAmount,
+      recoveryReason,
+      branchId,
+      monthlyAdminAmount,
+      codDeadline,
+      razorpayKeyId,
+      razorpaySecret,
+    ]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  double _n(TextEditingController c) => double.tryParse(c.text.trim()) ?? 0;
+  void _msg(String s) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s)));
+  }
+
+  Future<void> _saveKitAndPlan() async {
+    final uid = partnerUid.text.trim();
+    if (uid.isEmpty || _n(kitPrice) <= 0 || _n(maxRecovery) <= 0) {
+      _msg('Partner UID, Kit Price और Custom Maximum Recovery भरें');
+      return;
+    }
+    setState(() => busy = true);
+    try {
+      final db = FirebaseFirestore.instance;
+      final now = FieldValue.serverTimestamp();
+      final catalogRef = db.collection('kitCatalog').doc();
+      await catalogRef.set({
+        'name': kitName.text.trim().isEmpty
+            ? 'Delivery Kit'
+            : kitName.text.trim(),
+        'price': _n(kitPrice),
+        'policy': kitPolicy,
+        'active': true,
+        'createdAt': now,
+        'createdBy': FirebaseAuth.instance.currentUser?.uid,
+      });
+      await db.collection('kitRecoveryPlans').doc(uid).set({
+        'partnerUid': uid,
+        'kitId': catalogRef.id,
+        'kitName': kitName.text.trim(),
+        'kitPrice': _n(kitPrice),
+        'recoveryMode': recoveryMode,
+        'fixedAmount': _n(fixedRecovery),
+        'percentage': _n(percentRecovery),
+        'percentageBase': 'delivery',
+        'maxPerSettlement': _n(maxRecovery),
+        'kitPolicy': kitPolicy,
+        'requiresConsent': true,
+        'status': 'awaiting_partner_consent',
+        'updatedAt': now,
+        'updatedBy': FirebaseAuth.instance.currentUser?.uid,
+      }, SetOptions(merge: true));
+      _msg('Kit और Recovery Plan सेव हुआ। Partner की सहमति बाकी है।');
+    } catch (e) {
+      _msg('Save नहीं हुआ: $e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _queueManualRecovery() async {
+    final uid = partnerUid.text.trim();
+    final amount = _n(recoveryAmount);
+    final reason = recoveryReason.text.trim();
+    if (uid.isEmpty || amount <= 0 || reason.isEmpty) {
+      _msg('Partner UID, Amount और Reason भरें');
+      return;
+    }
+    setState(() => busy = true);
+    try {
+      final db = FirebaseFirestore.instance;
+      final consent = await db.collection('kitRecoveryConsents').doc(uid).get();
+      if (consent.data()?['accepted'] != true) {
+        _msg('Partner की डिजिटल सहमति के बिना Recovery नहीं हो सकती।');
+        return;
+      }
+      final plan = await db.collection('kitRecoveryPlans').doc(uid).get();
+      final p = plan.data() ?? <String, dynamic>{};
+      if (p['status'] != 'active') {
+        _msg('Recovery Plan Active नहीं है।');
+        return;
+      }
+      final cap = (p['maxPerSettlement'] as num?)?.toDouble() ?? 0;
+      if (cap <= 0 || amount > cap) {
+        _msg('यह राशि CEO द्वारा तय प्रति-Settlement Custom Limit से अधिक है।');
+        return;
+      }
+      final ref = db.collection('partnerRecoveryLedger').doc();
+      await ref.set({
+        'partnerUid': uid,
+        'amount': amount,
+        'reason': reason,
+        'type': 'manual_kit_recovery',
+        'status': 'queued_for_settlement',
+        'consentId': consent.data()?['consentId'] ?? '',
+        'createdAt': FieldValue.serverTimestamp(),
+        'createdBy': FirebaseAuth.instance.currentUser?.uid,
+      });
+      _msg(
+        'Recovery Settlement Queue में दर्ज हुई; अभी कोई पैसा नहीं काटा गया।',
+      );
+    } catch (e) {
+      _msg('Recovery दर्ज नहीं हुई: $e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _savePolicies() async {
+    if (branchId.text.trim().isEmpty) {
+      _msg('Branch ID भरें');
+      return;
+    }
+    await FirebaseFirestore.instance
+        .collection('appConfig')
+        .doc('financePolicy')
+        .set({
+          'codDeadline': codDeadline.text.trim(),
+          'codDeadlineMode': 'custom',
+          'adminPayoutDay': 2,
+          'updatedAt': FieldValue.serverTimestamp(),
+          'updatedBy': FirebaseAuth.instance.currentUser?.uid,
+        }, SetOptions(merge: true));
+    await FirebaseFirestore.instance
+        .collection('adminPayoutPolicy')
+        .doc(branchId.text.trim())
+        .set({
+          'branchId': branchId.text.trim(),
+          'monthlyFixedAmount': _n(monthlyAdminAmount),
+          'payoutDay': 2,
+          'active': true,
+          'updatedAt': FieldValue.serverTimestamp(),
+          'updatedBy': FirebaseAuth.instance.currentUser?.uid,
+        }, SetOptions(merge: true));
+    _msg('COD Custom Deadline और Admin payout policy सेव हुई।');
+  }
+
+  Future<void> _saveRazorpay() async {
+    if (razorpayKeyId.text.trim().isEmpty ||
+        razorpaySecret.text.trim().isEmpty) {
+      _msg('Live Key ID और Secret Key भरें');
+      return;
+    }
+    setState(() => busy = true);
+    try {
+      await FirebaseFunctions.instanceFor(region: 'asia-south1')
+          .httpsCallable('saveRazorpayKeys')
+          .call({
+            'keyId': razorpayKeyId.text.trim(),
+            'keySecret': razorpaySecret.text.trim(),
+          });
+      razorpaySecret.clear();
+      _msg('Razorpay keys सुरक्षित Backend Secret Manager में सेव हुईं।');
+    } on FirebaseFunctionsException catch (e) {
+      _msg('Backend setup/check आवश्यक है: ${e.message ?? e.code}');
+    } catch (e) {
+      _msg('Razorpay configuration सेव नहीं हुई: $e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Widget _field(
+    String label,
+    TextEditingController c, {
+    bool number = false,
+    bool secret = false,
+  }) => Padding(
+    padding: const EdgeInsets.only(bottom: 10),
+    child: TextField(
+      controller: c,
+      obscureText: secret,
+      keyboardType: number
+          ? const TextInputType.numberWithOptions(decimal: true)
+          : TextInputType.text,
+      decoration: InputDecoration(
+        labelText: label,
+        border: const OutlineInputBorder(),
+      ),
+    ),
+  );
+
+  Widget _section(String title, Widget child) => Card(
+    margin: const EdgeInsets.only(bottom: 14),
+    child: Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
+          ),
+          const SizedBox(height: 12),
+          child,
+        ],
+      ),
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('CEO Finance Control')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _section(
+            '1. Kit Catalog & Partner Recovery Plan',
+            Column(
+              children: [
+                _field('Delivery Partner UID', partnerUid),
+                _field('Kit / Item Name', kitName),
+                _field('Kit Price (₹)', kitPrice, number: true),
+                DropdownButtonFormField<String>(
+                  value: kitPolicy,
+                  decoration: const InputDecoration(labelText: 'Kit Policy'),
+                  items: const [
+                    DropdownMenuItem(
+                      value: 'mixed',
+                      child: Text('Mixed - Mandatory + Optional'),
+                    ),
+                    DropdownMenuItem(
+                      value: 'mandatory',
+                      child: Text('Mandatory'),
+                    ),
+                    DropdownMenuItem(
+                      value: 'optional',
+                      child: Text('Optional'),
+                    ),
+                  ],
+                  onChanged: (v) => setState(() => kitPolicy = v ?? 'mixed'),
+                ),
+                const SizedBox(height: 10),
+                DropdownButtonFormField<String>(
+                  value: recoveryMode,
+                  decoration: const InputDecoration(labelText: 'Recovery Mode'),
+                  items: const [
+                    DropdownMenuItem(
+                      value: 'fixed',
+                      child: Text('Fixed Amount'),
+                    ),
+                    DropdownMenuItem(
+                      value: 'percentage',
+                      child: Text('Percentage'),
+                    ),
+                    DropdownMenuItem(value: 'both', child: Text('Both')),
+                  ],
+                  onChanged: (v) => setState(() => recoveryMode = v ?? 'both'),
+                ),
+                const SizedBox(height: 10),
+                _field('Fixed Recovery (₹)', fixedRecovery, number: true),
+                _field(
+                  'Percentage of Delivery Earnings (%)',
+                  percentRecovery,
+                  number: true,
+                ),
+                _field(
+                  'Custom Maximum per Settlement (₹)',
+                  maxRecovery,
+                  number: true,
+                ),
+                FilledButton.icon(
+                  onPressed: busy ? null : _saveKitAndPlan,
+                  icon: const Icon(Icons.save),
+                  label: const Text('Save Kit & Plan'),
+                ),
+              ],
+            ),
+          ),
+          _section(
+            '2. CEO Manual Recovery Entry',
+            Column(
+              children: [
+                _field('Recovery Amount (₹)', recoveryAmount, number: true),
+                _field('Reason / Item Details', recoveryReason),
+                FilledButton.icon(
+                  onPressed: busy ? null : _queueManualRecovery,
+                  icon: const Icon(Icons.add_card),
+                  label: const Text('Add to Next Settlement'),
+                ),
+                const Text(
+                  'यह entry केवल अगले settlement के लिए queue होगी। Partner consent के बिना deduction नहीं होगा।',
+                  style: TextStyle(color: Colors.black54),
+                ),
+              ],
+            ),
+          ),
+          _section(
+            '3. COD Deadline & Admin Monthly Payout',
+            Column(
+              children: [
+                _field('Branch ID', branchId),
+                _field('COD Last Payment Time (HH:MM)', codDeadline),
+                _field(
+                  'Admin Fixed Monthly Earning (₹)',
+                  monthlyAdminAmount,
+                  number: true,
+                ),
+                const ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.event),
+                  title: Text('Admin Payout Date'),
+                  subtitle: Text('हर महीने की 2 तारीख'),
+                ),
+                FilledButton.icon(
+                  onPressed: busy ? null : _savePolicies,
+                  icon: const Icon(Icons.tune),
+                  label: const Text('Save Finance Policies'),
+                ),
+              ],
+            ),
+          ),
+          _section(
+            '4. Razorpay Live Configuration',
+            Column(
+              children: [
+                _field('Razorpay Live Key ID', razorpayKeyId),
+                _field('Razorpay Secret Key', razorpaySecret, secret: true),
+                FilledButton.icon(
+                  onPressed: busy ? null : _saveRazorpay,
+                  icon: const Icon(Icons.lock),
+                  label: const Text('Save Securely in Backend'),
+                ),
+                const Text(
+                  'Secret Key Firestore या Flutter में सेव नहीं होती। इसके लिए Cloud Functions और Secret Manager setup जरूरी है।',
+                  style: TextStyle(color: Colors.black54),
+                ),
+              ],
+            ),
+          ),
+          _section(
+            '5. COD Bank Deposit Verification',
+            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: FirebaseFirestore.instance
+                  .collection('codBankDeposits')
+                  .where('status', isEqualTo: 'pending_ceo_verification')
+                  .snapshots(),
+              builder: (context, snap) {
+                if (snap.hasError) return Text('Load error: ${snap.error}');
+                if (!snap.hasData)
+                  return const Center(child: CircularProgressIndicator());
+                if (snap.data!.docs.isEmpty)
+                  return const Text(
+                    'कोई COD deposit verification pending नहीं है।',
+                  );
+                return Column(
+                  children: snap.data!.docs.map((d) {
+                    final x = d.data();
+                    final amount = (x['amount'] as num?)?.toDouble() ?? 0;
+                    return ListTile(
+                      title: Text(
+                        '₹${amount.toStringAsFixed(2)} • ${x['branchId'] ?? ''}',
+                      ),
+                      subtitle: Text('Status: ${x['status']}'),
+                      trailing: TextButton(
+                        onPressed: () async {
+                          await d.reference.update({
+                            'status': 'verified',
+                            'verifiedBy':
+                                FirebaseAuth.instance.currentUser?.uid,
+                            'verifiedAt': FieldValue.serverTimestamp(),
+                          });
+                        },
+                        child: const Text('Verify'),
+                      ),
+                    );
+                  }).toList(),
+                );
+              },
+            ),
+          ),
+          _section(
+            '6. Admin Monthly Payouts (2 तारीख)',
+            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: FirebaseFirestore.instance
+                  .collection('adminMonthlyEarnings')
+                  .orderBy('monthKey', descending: true)
+                  .limit(50)
+                  .snapshots(),
+              builder: (context, snap) {
+                if (snap.hasError) return Text('Load error: ${snap.error}');
+                if (!snap.hasData)
+                  return const Center(child: CircularProgressIndicator());
+                if (snap.data!.docs.isEmpty)
+                  return const Text(
+                    'अभी monthly payout record नहीं है। 2 तारीख को scheduled record बनेगा।',
+                  );
+                return Column(
+                  children: snap.data!.docs.map((d) {
+                    final x = d.data();
+                    final earned = (x['earnedAmount'] as num?)?.toDouble() ?? 0;
+                    final paid = (x['paidAmount'] as num?)?.toDouble() ?? 0;
+                    final isPaid = x['payoutStatus'] == 'paid';
+                    return ListTile(
+                      title: Text(
+                        '${x['branchId'] ?? ''} • ${x['monthKey'] ?? ''}',
+                      ),
+                      subtitle: Text(
+                        'Earned ₹${earned.toStringAsFixed(2)} • Paid ₹${paid.toStringAsFixed(2)} • ${x['payoutStatus'] ?? 'due'}',
+                      ),
+                      trailing: isPaid
+                          ? const Icon(Icons.check_circle, color: Colors.green)
+                          : TextButton(
+                              onPressed: () async {
+                                final refController = TextEditingController();
+                                final ok = await showDialog<bool>(
+                                  context: context,
+                                  builder: (ctx) => AlertDialog(
+                                    title: const Text('Confirm Admin Payout'),
+                                    content: TextField(
+                                      controller: refController,
+                                      decoration: const InputDecoration(
+                                        labelText:
+                                            'Bank UTR / Transaction Reference',
+                                      ),
+                                    ),
+                                    actions: [
+                                      TextButton(
+                                        onPressed: () =>
+                                            Navigator.pop(ctx, false),
+                                        child: const Text('Cancel'),
+                                      ),
+                                      FilledButton(
+                                        onPressed: () =>
+                                            Navigator.pop(ctx, true),
+                                        child: const Text('Mark Paid'),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                                if (ok == true &&
+                                    refController.text.trim().isNotEmpty) {
+                                  await d.reference.update({
+                                    'paidAmount': earned,
+                                    'payoutStatus': 'paid',
+                                    'payoutReference': refController.text
+                                        .trim(),
+                                    'paidAt': FieldValue.serverTimestamp(),
+                                    'paidBy':
+                                        FirebaseAuth.instance.currentUser?.uid,
+                                  });
+                                }
+                                refController.dispose();
+                              },
+                              child: const Text('Mark Paid'),
+                            ),
+                    );
+                  }).toList(),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

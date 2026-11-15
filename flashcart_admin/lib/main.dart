@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:image_picker/image_picker.dart';
@@ -634,6 +635,7 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
       branchName: currentAdminBranchName,
     ),
     AdminFestivalPostersPage(),
+    const AdminFinanceSettlementPage(),
   ];
 
   final titles = [
@@ -658,6 +660,7 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
     'Partner Payments',
     'My Bank Details',
     'Festival Posters & Banners',
+    'COD Settlement & Monthly Earnings',
   ];
 
   StreamSubscription<QuerySnapshot>? _orderSubscription;
@@ -904,6 +907,11 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
                     19,
                     Icons.account_balance_rounded,
                     'My Bank Details',
+                  ),
+                  drawerItem(
+                    21,
+                    Icons.payments_rounded,
+                    'COD Settlement & Monthly Earnings',
                   ),
                   const SizedBox(height: 12),
                 ],
@@ -3919,6 +3927,115 @@ class DeliveryPartnersPage extends StatelessWidget {
     return 'XXXX XXXX ${digits.substring(8)}';
   }
 
+  Future<void> _showAddFeeDialog(
+    BuildContext context,
+    String partnerUid,
+    String partnerName,
+  ) async {
+    String selectedFee = 'T-Shirt Fee';
+    final options = ['T-Shirt Fee', 'Delivery Bag Fee', 'Cap Fee', 'Other Fee'];
+    final amountCtrl = TextEditingController();
+    final noteCtrl = TextEditingController();
+    bool saving = false;
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          title: const Text(
+            'Add Fee / Cut (Admin)',
+            style: TextStyle(fontWeight: FontWeight.w900),
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Partner: $partnerName',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: options
+                      .map(
+                        (opt) => ChoiceChip(
+                          label: Text(opt),
+                          selected: selectedFee == opt,
+                          onSelected: (_) => setLocal(() => selectedFee = opt),
+                        ),
+                      )
+                      .toList(),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: amountCtrl,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  decoration: const InputDecoration(
+                    labelText: 'Amount (₹)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: noteCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Reason / Note (Optional)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: saving ? null : () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: saving
+                  ? null
+                  : () async {
+                      final amt = double.tryParse(amountCtrl.text.trim()) ?? 0;
+                      if (amt <= 0) return;
+                      setLocal(() => saving = true);
+                      await FirebaseFirestore.instance
+                          .collection('partnerRecoveryLedger')
+                          .add({
+                            'partnerUid': partnerUid,
+                            'partnerName': partnerName,
+                            'branchId': currentAdminBranchId,
+                            'reason': selectedFee,
+                            'note': noteCtrl.text.trim(),
+                            'amount': amt,
+                            'status': 'pending',
+                            'addedByRole': 'Admin',
+                            'addedByUid':
+                                FirebaseAuth.instance.currentUser?.uid ?? '',
+                            'createdAt': FieldValue.serverTimestamp(),
+                          });
+                      if (ctx.mounted) {
+                        Navigator.pop(ctx);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text(
+                              '₹${amt.toStringAsFixed(0)} ($selectedFee) जोड़ दिया गया ✅',
+                            ),
+                          ),
+                        );
+                      }
+                    },
+              child: Text(saving ? 'Saving...' : 'Add Fee'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
@@ -4197,11 +4314,25 @@ class DeliveryPartnersPage extends StatelessWidget {
                               '${available ? 'AVAILABLE' : 'BUSY'}',
                             ),
                             isThreeLine: true,
-                            trailing: Switch(
-                              value: active,
-                              activeColor: orange,
-                              onChanged: (value) =>
-                                  setActive(context, doc.id, value),
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  tooltip: 'Add T-Shirt / Bag / Cap Fee',
+                                  icon: const Icon(
+                                    Icons.currency_rupee_rounded,
+                                    color: orange,
+                                  ),
+                                  onPressed: () =>
+                                      _showAddFeeDialog(context, doc.id, name),
+                                ),
+                                Switch(
+                                  value: active,
+                                  activeColor: orange,
+                                  onChanged: (value) =>
+                                      setActive(context, doc.id, value),
+                                ),
+                              ],
                             ),
                           ),
                         );
@@ -7381,6 +7512,316 @@ class _AdminBankDetailsPageState extends State<AdminBankDetailsPage> {
           const Text(
             'नोट: Save करने के बाद CEO App में Verification Status Pending दिखना चाहिए। Private Supabase bucket और Edge Function permissions सही configured होने चाहिए.',
             style: TextStyle(color: Colors.grey),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================
+// FLASHCART ADMIN COD SETTLEMENT & MONTHLY EARNINGS
+// ============================================================
+class AdminFinanceSettlementPage extends StatefulWidget {
+  const AdminFinanceSettlementPage({super.key});
+  @override
+  State<AdminFinanceSettlementPage> createState() =>
+      _AdminFinanceSettlementPageState();
+}
+
+class _AdminFinanceSettlementPageState
+    extends State<AdminFinanceSettlementPage> {
+  final amount = TextEditingController();
+  bool busy = false;
+
+  @override
+  void dispose() {
+    amount.dispose();
+    super.dispose();
+  }
+
+  double get _amount => double.tryParse(amount.text.trim()) ?? 0;
+
+  Future<void> _createPaymentLink() async {
+    if (currentAdminBranchId.isEmpty || _amount <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Branch और सही COD Amount आवश्यक है।')),
+      );
+      return;
+    }
+    setState(() => busy = true);
+    try {
+      final result = await FirebaseFunctions.instanceFor(region: 'asia-south1')
+          .httpsCallable('createCodPaymentLink')
+          .call({'branchId': currentAdminBranchId, 'amount': _amount});
+      final data = Map<String, dynamic>.from(result.data as Map);
+      final url = data['shortUrl']?.toString() ?? '';
+      if (url.isNotEmpty) {
+        final uri = Uri.parse(url);
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      }
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Razorpay COD Payment Link तैयार है।')),
+        );
+    } on FirebaseFunctionsException catch (e) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Payment Link error: ${e.message ?? e.code}')),
+        );
+    } catch (e) {
+      if (mounted)
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Payment Link नहीं बना: $e')));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final db = FirebaseFirestore.instance;
+    final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
+    final today = DateTime.now();
+    final previousMonth = DateTime(today.year, today.month - 1, 1);
+    final monthKey =
+        '${previousMonth.year}-${previousMonth.month.toString().padLeft(2, '0')}';
+    return Scaffold(
+      appBar: AppBar(title: const Text('COD Settlement & Admin Earnings')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Admin को प्राप्त COD Cash (कुल)',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                    stream: db
+                        .collection('codCashHandovers')
+                        .where('branchId', isEqualTo: currentAdminBranchId)
+                        .where('status', isEqualTo: 'received')
+                        .snapshots(),
+                    builder: (context, snap) {
+                      if (!snap.hasData) return const LinearProgressIndicator();
+                      final total = snap.data!.docs.fold<double>(
+                        0,
+                        (s, d) =>
+                            s + ((d.data()['amount'] as num?)?.toDouble() ?? 0),
+                      );
+                      return Text(
+                        '₹${total.toStringAsFixed(2)}',
+                        style: const TextStyle(
+                          fontSize: 28,
+                          fontWeight: FontWeight.w900,
+                          color: Colors.deepOrange,
+                        ),
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'Delivery Partner से प्राप्त COD Cash को कंपनी में जमा करने के लिए Razorpay Link बनाएँ।',
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: amount,
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    decoration: const InputDecoration(
+                      labelText: 'Company को जमा करने की राशि (₹)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  FilledButton.icon(
+                    onPressed: busy ? null : _createPaymentLink,
+                    icon: const Icon(Icons.payment),
+                    label: Text(
+                      busy
+                          ? 'Please wait...'
+                          : 'Generate Razorpay Payment Link',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Pending Partner Cash Handovers',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                    stream: db
+                        .collection('codCashHandovers')
+                        .where('branchId', isEqualTo: currentAdminBranchId)
+                        .where('status', isEqualTo: 'pending')
+                        .snapshots(),
+                    builder: (context, snap) {
+                      if (!snap.hasData) return const LinearProgressIndicator();
+                      if (snap.data!.docs.isEmpty)
+                        return const Text(
+                          'कोई COD cash handover pending नहीं है।',
+                        );
+                      return Column(
+                        children: snap.data!.docs.map((d) {
+                          final x = d.data();
+                          return ListTile(
+                            title: Text('₹${x['amount'] ?? 0}'),
+                            subtitle: Text('Partner: ${x['partnerUid'] ?? ''}'),
+                            trailing: TextButton(
+                              onPressed: () async {
+                                await d.reference.update({
+                                  'status': 'received',
+                                  'receivedAt': FieldValue.serverTimestamp(),
+                                  'receivedBy': uid,
+                                });
+                              },
+                              child: const Text('Cash Received'),
+                            ),
+                          );
+                        }).toList(),
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'COD Payment History',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                    stream: db
+                        .collection('codBankDeposits')
+                        .where('branchId', isEqualTo: currentAdminBranchId)
+                        .snapshots(),
+                    builder: (context, snap) {
+                      if (!snap.hasData) return const LinearProgressIndicator();
+                      if (snap.data!.docs.isEmpty)
+                        return const Text('अभी कोई payment record नहीं है।');
+                      return Column(
+                        children: snap.data!.docs.map((d) {
+                          final x = d.data();
+                          return ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: Text(
+                              '₹${((x['amount'] as num?)?.toDouble() ?? 0).toStringAsFixed(2)}',
+                            ),
+                            subtitle: Text(
+                              'Status: ${x['status'] ?? 'pending'}',
+                            ),
+                            trailing: const Icon(Icons.receipt_long),
+                          );
+                        }).toList(),
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'My Monthly Earnings',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  Text('Payout Date: हर महीने की 2 तारीख • Month: $monthKey'),
+                  StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                    stream: db
+                        .collection('adminMonthlyEarnings')
+                        .doc('${currentAdminBranchId}_$monthKey')
+                        .snapshots(),
+                    builder: (context, snap) {
+                      if (!snap.hasData) return const LinearProgressIndicator();
+                      final x = snap.data?.data() ?? {};
+                      final earned =
+                          (x['earnedAmount'] as num?)?.toDouble() ?? 0;
+                      final paid = (x['paidAmount'] as num?)?.toDouble() ?? 0;
+                      final status =
+                          x['payoutStatus']?.toString() ?? 'not_generated';
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Earned: ₹${earned.toStringAsFixed(2)}',
+                            style: const TextStyle(
+                              fontSize: 25,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                          Text(
+                            'Paid: ₹${paid.toStringAsFixed(2)} • Pending: ₹${(earned - paid).clamp(0, double.infinity).toStringAsFixed(2)}',
+                          ),
+                          Text('Payout Status: $status'),
+                        ],
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Monthly earning CEO द्वारा सेट किए गए Admin Payout Policy से बनेगी। COD collection आपकी earning नहीं है।',
+                    style: TextStyle(color: Colors.black54),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+            stream: db.collection('appConfig').doc('financePolicy').snapshots(),
+            builder: (context, snap) {
+              final deadline =
+                  snap.data?.data()?['codDeadline']?.toString() ??
+                  'CEO ने समय सेट नहीं किया';
+              final parts = deadline.split(':');
+              var overdue = false;
+              if (parts.length == 2) {
+                final h = int.tryParse(parts[0]) ?? 23;
+                final m = int.tryParse(parts[1]) ?? 59;
+                final now = DateTime.now();
+                overdue = now.hour > h || (now.hour == h && now.minute >= m);
+              }
+              return Card(
+                color: overdue ? const Color(0xFFFFE8E8) : null,
+                child: ListTile(
+                  leading: Icon(
+                    Icons.warning_amber_rounded,
+                    color: overdue ? Colors.red : Colors.deepOrange,
+                  ),
+                  title: Text(
+                    overdue ? 'COD PAYMENT OVERDUE' : 'COD Payment Deadline',
+                  ),
+                  subtitle: Text(
+                    'आज कंपनी को COD जमा करने की अंतिम समय-सीमा: $deadline',
+                  ),
+                ),
+              );
+            },
           ),
         ],
       ),

@@ -1,14 +1,24 @@
+
+import java.util.Properties
+import java.io.FileInputStream
+
 plugins {
     id("com.android.application")
-    // START: FlutterFire Configuration
     id("com.google.gms.google-services")
-    // END: FlutterFire Configuration
-    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+val keystoreProperties = Properties()
+val keystorePropertiesFile = rootProject.file("key.properties")
+
+if (!keystorePropertiesFile.exists()) {
+    throw GradleException("key.properties file not found in android folder")
+}
+
+keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+
 android {
-    namespace = "com.example.flash_cart"
+    namespace = "in.flashcarts.customer"
     compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
@@ -19,18 +29,25 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID.
-        applicationId = "com.example.flash_cart"
+        applicationId = "in.flashcarts.customer"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
 
+    signingConfigs {
+        create("release") {
+            keyAlias = keystoreProperties["keyAlias"] as String
+            keyPassword = keystoreProperties["keyPassword"] as String
+            storeFile = file(keystoreProperties["storeFile"] as String)
+            storePassword = keystoreProperties["storePassword"] as String
+        }
+    }
+
     buildTypes {
         release {
-            // Temporary debug signing so flutter run --release works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 }

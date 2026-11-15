@@ -12,9 +12,16 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/services.dart';
 
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:image_picker/image_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:razorpay_flutter/razorpay_flutter.dart';
+import 'package:flutter_cashfree_pg_sdk/api/cferrorresponse/cferrorresponse.dart';
+import 'package:flutter_cashfree_pg_sdk/api/cfpayment/cfwebcheckoutpayment.dart';
+import 'package:flutter_cashfree_pg_sdk/api/cfpaymentgateway/cfpaymentgatewayservice.dart';
+import 'package:flutter_cashfree_pg_sdk/api/cfsession/cfsession.dart';
+import 'package:flutter_cashfree_pg_sdk/utils/cfenums.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geolocator/geolocator.dart';
 
@@ -25,11 +32,254 @@ const flashCartSupportEmail = 'sudhirkuumar553@gmail.com';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-  await CustomerNotificationService.initialize();
+
+  // हमने नोटिफिकेशन वाली लाइन हटा दी है ताकि क्रैश न हो
   runApp(const FlashCartApp());
 }
 
+// Native Razorpay Checkout: opens the payment sheet inside FlashCart.
+class FlashCartNativeRazorpay {
+  FlashCartNativeRazorpay._() {
+    _razorpay.on(Razorpay.EVENT_PAYMENT_SUCCESS, _onSuccess);
+    _razorpay.on(Razorpay.EVENT_PAYMENT_ERROR, _onError);
+    _razorpay.on(Razorpay.EVENT_EXTERNAL_WALLET, _onExternalWallet);
+  }
+
+  static final FlashCartNativeRazorpay instance = FlashCartNativeRazorpay._();
+  final Razorpay _razorpay = Razorpay();
+  Completer<PaymentSuccessResponse>? _pending;
+
+  Future<PaymentSuccessResponse> open(Map<String, dynamic> options) {
+    if (_pending != null && !_pending!.isCompleted) {
+      throw StateError('एक Payment पहले से खुला हुआ है।');
+    }
+    final completer = Completer<PaymentSuccessResponse>();
+    _pending = completer;
+    try {
+      _razorpay.open(options);
+    } catch (e) {
+      completer.completeError(StateError('Razorpay Checkout नहीं खुला: $e'));
+    }
+    return completer.future.whenComplete(() {
+      if (identical(_pending, completer)) _pending = null;
+    });
+  }
+
+  void _onSuccess(PaymentSuccessResponse response) {
+    final pending = _pending;
+    if (pending != null && !pending.isCompleted) pending.complete(response);
+  }
+
+  void _onError(PaymentFailureResponse response) {
+    final pending = _pending;
+    if (pending != null && !pending.isCompleted) {
+      pending.completeError(
+        StateError(
+          'Code ${response.code}: ${(response.message ?? '').isNotEmpty ? response.message! : 'Payment पूरा नहीं हुआ।'}',
+        ),
+      );
+    }
+  }
+
+  void _onExternalWallet(ExternalWalletResponse response) {
+    // Razorpay sends the final success/failure event after returning from a wallet.
+  }
+}
+
+const String _flashCartPaymentHost =
+    'asia-south1-sudhir2006-32c75.cloudfunctions.net';
+
+Future<Map<String, dynamic>> _flashCartPaymentWorkerCall(
+  Uri endpoint,
+  Map<String, dynamic> payload,
+) async {
+  final currentUser = FirebaseAuth.instance.currentUser;
+  if (currentUser == null) throw StateError('कृपया दोबारा login करें।');
+  final idToken = await currentUser.getIdToken(true);
+  if (idToken == null || idToken.isEmpty) {
+    throw StateError('Firebase login token नहीं मिला।');
+  }
+  final client = HttpClient();
+  try {
+    // Endpoint is built separately from the JSON payload. This prevents the
+    // complete orderData JSON from ever being interpreted as a URL/path.
+    if (endpoint.host != _flashCartPaymentHost ||
+        !const {
+          '/flashCartPayment/payment/native-session',
+          '/flashCartPayment/payment/native-verify',
+          '/flashCartPayment/order/cod-place',
+          '/cashfreePayment/payment/create-order',
+          '/cashfreePayment/payment/verify',
+          '/cashfreePayment/order/cancel-refund',
+        }.contains(endpoint.path)) {
+      throw StateError('Firebase Payment Function endpoint invalid है।');
+    }
+    final request = await client.postUrl(endpoint);
+    request.headers.set(
+      HttpHeaders.contentTypeHeader,
+      'application/json; charset=utf-8',
+    );
+    request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $idToken');
+    // Encode as UTF-8 bytes so emojis (like 🛍️) and Hindi text never throw Invalid argument
+    final bodyBytes = utf8.encode(jsonEncode(payload));
+    request.headers.contentLength = bodyBytes.length;
+    request.add(bodyBytes);
+
+    final response = await request.close();
+    final responseText = await response.transform(utf8.decoder).join();
+    dynamic decodedBody;
+    try {
+      decodedBody = jsonDecode(responseText);
+    } catch (_) {
+      throw StateError(
+        'Payment server ने invalid response दिया (HTTP ${response.statusCode})।',
+      );
+    }
+    final decoded = decodedBody;
+    if (decoded is! Map<String, dynamic>) {
+      throw StateError('Payment server का response सही नहीं है।');
+    }
+    if (response.statusCode < 200 ||
+        response.statusCode >= 300 ||
+        decoded['ok'] != true) {
+      throw StateError(
+        (decoded['error'] ?? 'Payment request पूरा नहीं हुआ।').toString(),
+      );
+    }
+    return decoded;
+  } finally {
+    client.close(force: true);
+  }
+}
+
+Future<bool> _startFlashCartNativePayment({
+  required String orderId,
+  required Map<String, dynamic> orderData,
+}) async {
+  if (!RegExp(r'^[A-Za-z0-9_-]{8,80}$').hasMatch(orderId)) {
+    throw StateError('Checkout ID सही नहीं है।');
+  }
+  final created = await _flashCartPaymentWorkerCall(
+    Uri.https(_flashCartPaymentHost, 'flashCartPayment/payment/native-session'),
+    {'orderId': orderId, 'orderData': orderData},
+  );
+  final keyId = (created['keyId'] ?? '').toString().trim();
+  final razorpayOrderId = (created['razorpayOrderId'] ?? '').toString().trim();
+
+  final amount = (created['amount'] as num?)?.toInt() ?? 0;
+  if (!keyId.startsWith('rzp_') ||
+      !razorpayOrderId.startsWith('order_') ||
+      amount < 100) {
+    throw StateError('Secure Razorpay Checkout details नहीं मिले।');
+  }
+
+  final payment = await FlashCartNativeRazorpay.instance.open({
+    'key': keyId,
+    'order_id': razorpayOrderId,
+    'amount': amount,
+    'currency': 'INR',
+    'name': 'FlashCart',
+    'description': 'Grocery Order $orderId',
+    'retry': {'enabled': true, 'max_count': 2},
+    'send_sms_hash': true,
+    'prefill': {
+      'contact': (orderData['userPhone'] ?? '').toString(),
+      'name': (orderData['customerName'] ?? 'FlashCart Customer').toString(),
+    },
+    'theme': {'color': '#E53935'},
+  });
+
+  final verified = await _flashCartPaymentWorkerCall(
+    Uri.https(_flashCartPaymentHost, 'flashCartPayment/payment/native-verify'),
+    {
+      'orderId': orderId,
+      'razorpayOrderId': payment.orderId ?? razorpayOrderId,
+      'razorpayPaymentId': payment.paymentId ?? '',
+      'razorpaySignature': payment.signature ?? '',
+    },
+  );
+  return verified['paymentStatus']?.toString().toLowerCase() == 'paid' &&
+      verified['orderCreated'] == true;
+}
+
 // ======================================================
+
+// ======================================================
+// CASHFREE NATIVE CHECKOUT
+// ======================================================
+Future<bool> _startFlashCartCashfreePayment({
+  required String orderId,
+  required Map<String, dynamic> orderData,
+}) async {
+  if (!RegExp(r'^[A-Za-z0-9_-]{8,80}$').hasMatch(orderId)) {
+    throw StateError('Checkout ID सही नहीं है।');
+  }
+
+  final created = await _flashCartPaymentWorkerCall(
+    Uri.https(_flashCartPaymentHost, 'cashfreePayment/payment/create-order'),
+    {'orderId': orderId, 'orderData': orderData},
+  );
+
+  final cashfreeOrderId = (created['orderId'] ?? '').toString();
+  final paymentSessionId = (created['paymentSessionId'] ?? '').toString();
+  final envName = (created['environment'] ?? 'SANDBOX')
+      .toString()
+      .toUpperCase();
+  if (cashfreeOrderId.isEmpty || paymentSessionId.isEmpty) {
+    throw StateError('Cashfree Payment Session नहीं मिली।');
+  }
+
+  final environment = envName == 'PRODUCTION'
+      ? CFEnvironment.PRODUCTION
+      : CFEnvironment.SANDBOX;
+  final session = CFSessionBuilder()
+      .setEnvironment(environment)
+      .setOrderId(cashfreeOrderId)
+      .setPaymentSessionId(paymentSessionId)
+      .build();
+
+  final completer = Completer<String>();
+  final gateway = CFPaymentGatewayService();
+  gateway.setCallback(
+    (String returnedOrderId) {
+      if (!completer.isCompleted) completer.complete(returnedOrderId);
+    },
+    (CFErrorResponse errorResponse, String returnedOrderId) {
+      if (!completer.isCompleted) {
+        final String? errorMessage = errorResponse.getMessage();
+
+        completer.completeError(
+          StateError(
+            (errorMessage != null && errorMessage.isNotEmpty)
+                ? errorMessage
+                : 'Cashfree Payment पूरी नहीं हुई।',
+          ),
+        );
+      }
+    },
+  );
+
+  final checkout = CFWebCheckoutPaymentBuilder().setSession(session).build();
+  gateway.doPayment(checkout);
+
+  final returnedOrderId = await completer.future.timeout(
+    const Duration(minutes: 5),
+    onTimeout: () => throw TimeoutException(
+      'Payment response नहीं मिला। Payment Status दोबारा जाँचें।',
+    ),
+  );
+  if (returnedOrderId != cashfreeOrderId) {
+    throw StateError('Cashfree Order ID match नहीं हुआ।');
+  }
+
+  final verified = await _flashCartPaymentWorkerCall(
+    Uri.https(_flashCartPaymentHost, 'cashfreePayment/payment/verify'),
+    {'orderId': orderId},
+  );
+  return verified['paymentStatus']?.toString().toLowerCase() == 'paid' &&
+      verified['orderCreated'] == true;
+}
+
 // NOTIFICATIONS / HOURLY ORDER REMINDER
 // ======================================================
 class CustomerNotificationService {
@@ -1044,6 +1294,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   int selectedTab = 0;
+  final int _sessionShuffleSeed = DateTime.now().millisecondsSinceEpoch;
   String selectedCategory = 'All';
   bool showDiscountedOnly = false;
 
@@ -1072,6 +1323,98 @@ class _HomePageState extends State<HomePage> {
     _loadCustomerProfile();
   }
 
+  Map<String, int> _categoryAffinity = {};
+  List<String> _recentInterestKeywords = [];
+
+  static const Map<String, List<String>> _relatedGroceryGroups = {
+    'chai': [
+      'tea',
+      'milk',
+      'doodh',
+      'sugar',
+      'chini',
+      'biscuit',
+      'rusk',
+      'ginger',
+      'adrak',
+      'elaichi',
+    ],
+    'tea': ['chai', 'milk', 'sugar', 'biscuit', 'rusk', 'ginger'],
+    'milk': [
+      'doodh',
+      'bread',
+      'butter',
+      'curd',
+      'dahi',
+      'paneer',
+      'tea',
+      'coffee',
+      'cornflakes',
+    ],
+    'aloo': [
+      'pyaz',
+      'onion',
+      'tamatar',
+      'tomato',
+      'gobhi',
+      'matar',
+      'oil',
+      'masala',
+      'namak',
+      'sabzi',
+    ],
+    'pyaz': [
+      'aloo',
+      'potato',
+      'tamatar',
+      'tomato',
+      'lahsun',
+      'garlic',
+      'adrak',
+      'oil',
+    ],
+    'atta': [
+      'rice',
+      'chawal',
+      'dal',
+      'oil',
+      'ghee',
+      'salt',
+      'namak',
+      'besan',
+      'suji',
+    ],
+    'rice': [
+      'chawal',
+      'dal',
+      'rajma',
+      'chole',
+      'ghee',
+      'oil',
+      'masala',
+      'papad',
+    ],
+    'bread': ['butter', 'jam', 'milk', 'egg', 'cheese', 'sauce'],
+    'biscuit': [
+      'namkeen',
+      'chips',
+      'tea',
+      'chai',
+      'chocolate',
+      'cake',
+      'juice',
+    ],
+    'soap': [
+      'shampoo',
+      'toothpaste',
+      'brush',
+      'detergent',
+      'surf',
+      'facewash',
+      'oil',
+    ],
+  };
+
   Future<void> _loadCustomerProfile() async {
     final uid = currentUser?.uid;
     if (uid == null) return;
@@ -1086,10 +1429,95 @@ class _HomePageState extends State<HomePage> {
         profileName =
             data['profileName']?.toString() ?? data['name']?.toString() ?? '';
         profileImageBase64 = data['profileImageBase64']?.toString() ?? '';
+
+        final rawCat = data['categoryAffinity'];
+        if (rawCat is Map) {
+          _categoryAffinity = rawCat.map(
+            (k, v) => MapEntry(k.toString(), (v as num?)?.toInt() ?? 0),
+          );
+        }
+        final rawKw = data['recentInterestKeywords'];
+        if (rawKw is List) {
+          _recentInterestKeywords = rawKw.map((e) => e.toString()).toList();
+        }
       });
     } catch (_) {
       // Profile is optional; never block the home screen.
     }
+  }
+
+  void _recordUserInterest({String? query, Product? product}) {
+    bool changed = false;
+
+    if (product != null) {
+      final cat = product.category.trim();
+      if (cat.isNotEmpty) {
+        _categoryAffinity[cat] = (_categoryAffinity[cat] ?? 0) + 3;
+        changed = true;
+      }
+      for (final word in product.name.toLowerCase().split(
+        RegExp(r'[^a-z0-9]+'),
+      )) {
+        if (word.length >= 3 && !_recentInterestKeywords.contains(word)) {
+          _recentInterestKeywords.insert(0, word);
+          changed = true;
+        }
+      }
+    }
+
+    if (query != null && query.trim().length >= 3) {
+      final clean = query.trim().toLowerCase();
+      for (final word in clean.split(RegExp(r'[^a-z0-9]+'))) {
+        if (word.length >= 3) {
+          _recentInterestKeywords.remove(word);
+          _recentInterestKeywords.insert(0, word);
+          changed = true;
+        }
+      }
+    }
+
+    if (_recentInterestKeywords.length > 15) {
+      _recentInterestKeywords = _recentInterestKeywords.sublist(0, 15);
+    }
+
+    if (changed) {
+      _saveUserInterestsToCloud();
+    }
+  }
+
+  Future<void> _saveUserInterestsToCloud() async {
+    final uid = currentUser?.uid;
+    if (uid == null) return;
+    try {
+      await FirebaseFirestore.instance.collection('users').doc(uid).set({
+        'categoryAffinity': _categoryAffinity,
+        'recentInterestKeywords': _recentInterestKeywords,
+      }, SetOptions(merge: true));
+    } catch (_) {}
+  }
+
+  int _smartProductScore(Product p) {
+    int score = 0;
+    score += (_categoryAffinity[p.category] ?? 0) * 10;
+
+    final pText = '${p.name} ${p.category} ${p.description}'.toLowerCase();
+
+    for (final kw in _recentInterestKeywords) {
+      if (pText.contains(kw)) {
+        score += 18;
+      }
+      final relatedList = _relatedGroceryGroups[kw];
+      if (relatedList != null) {
+        for (final rel in relatedList) {
+          if (pText.contains(rel)) {
+            score += 14;
+          }
+        }
+      }
+    }
+
+    if (p.discount > 0) score += 5;
+    return score;
   }
 
   Future<void> _editCustomerProfile() async {
@@ -1275,6 +1703,7 @@ class _HomePageState extends State<HomePage> {
   double get cartTotal => cart.fold(0, (sum, item) => sum + item.total);
 
   void addToCart(Product product) {
+    _recordUserInterest(product: product);
     if (!product.available || product.stock <= 0) {
       _showSnack('This product is currently unavailable', error: true);
 
@@ -1582,8 +2011,30 @@ class _HomePageState extends State<HomePage> {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return _loadingHome();
         }
+        final rawList = _productsFromSnapshot(snapshot.data!);
 
-        final allProducts = _productsFromSnapshot(snapshot.data!);
+        if (searchText.trim().length >= 3) {
+          final q = searchText.trim().toLowerCase();
+          for (final p in rawList) {
+            if (p.name.toLowerCase().contains(q) ||
+                p.category.toLowerCase().contains(q)) {
+              _categoryAffinity[p.category] =
+                  (_categoryAffinity[p.category] ?? 0) + 1;
+            }
+          }
+        }
+
+        final allProducts = rawList.toList()
+          ..sort((a, b) {
+            final scoreA = _smartProductScore(a);
+            final scoreB = _smartProductScore(b);
+            if (scoreA != scoreB) {
+              return scoreB.compareTo(scoreA);
+            }
+            final hashA = (a.id.hashCode ^ _sessionShuffleSeed) & 0x7fffffff;
+            final hashB = (b.id.hashCode ^ _sessionShuffleSeed) & 0x7fffffff;
+            return hashA.compareTo(hashB);
+          });
 
         final availableProducts = allProducts
             .where((p) => p.available && p.stock > 0)
@@ -1910,7 +2361,10 @@ class _HomePageState extends State<HomePage> {
 
         textInputAction: TextInputAction.search,
 
-        onChanged: (value) => setState(() => searchText = value),
+        onChanged: (value) {
+          setState(() => searchText = value);
+          _recordUserInterest(query: value);
+        },
 
         decoration: InputDecoration(
           hintText: 'Search for atta, dal, fruits, snacks...',
@@ -2736,6 +3190,137 @@ class _HomePageState extends State<HomePage> {
                             ),
                           ],
                         ),
+                        const SizedBox(height: 14),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text(
+                              'Select Quantity',
+                              style: TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.black87,
+                              ),
+                            ),
+                            if (!product.available || product.stock <= 0)
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 14,
+                                  vertical: 8,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.grey.shade200,
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: const Text(
+                                  'Out of Stock',
+                                  style: TextStyle(
+                                    color: Colors.grey,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              )
+                            else if (quantityInCart(product) == 0)
+                              SizedBox(
+                                height: 38,
+                                width: 118,
+                                child: OutlinedButton.icon(
+                                  onPressed: () {
+                                    addToCart(product);
+                                    setSheetState(() {});
+                                  },
+                                  icon: const Icon(Icons.add, size: 18),
+                                  label: const Text(
+                                    'ADD',
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w800,
+                                      fontSize: 14,
+                                    ),
+                                  ),
+                                  style: OutlinedButton.styleFrom(
+                                    foregroundColor: const Color(0xFF168A43),
+                                    side: const BorderSide(
+                                      color: Color(0xFF168A43),
+                                      width: 1.5,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    backgroundColor: const Color(0xFFF1F8F4),
+                                  ),
+                                ),
+                              )
+                            else
+                              Container(
+                                height: 38,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF168A43),
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(
+                                        minWidth: 38,
+                                        minHeight: 38,
+                                      ),
+                                      icon: const Icon(
+                                        Icons.remove,
+                                        color: Colors.white,
+                                        size: 18,
+                                      ),
+                                      onPressed: () {
+                                        final idx = cart.indexWhere(
+                                          (c) => c.product.id == product.id,
+                                        );
+                                        if (idx != -1) {
+                                          decreaseQuantity(idx);
+                                          setSheetState(() {});
+                                        }
+                                      },
+                                    ),
+                                    Padding(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                      ),
+                                      child: Text(
+                                        '${quantityInCart(product)}',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 15,
+                                        ),
+                                      ),
+                                    ),
+                                    IconButton(
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(
+                                        minWidth: 38,
+                                        minHeight: 38,
+                                      ),
+                                      icon: const Icon(
+                                        Icons.add,
+                                        color: Colors.white,
+                                        size: 18,
+                                      ),
+                                      onPressed: () {
+                                        final idx = cart.indexWhere(
+                                          (c) => c.product.id == product.id,
+                                        );
+                                        if (idx != -1) {
+                                          increaseQuantity(idx);
+                                          setSheetState(() {});
+                                        }
+                                      },
+                                    ),
+                                  ],
+                                ),
+                              ),
+                          ],
+                        ),
+
                         const SizedBox(height: 16),
                         _ProductReviewsSection(
                           productId: product.id,
@@ -3279,7 +3864,7 @@ class _HomePageState extends State<HomePage> {
                   ),
 
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFE53935),
+                    backgroundColor: Colors.blue,
 
                     foregroundColor: Colors.white,
 
@@ -3429,6 +4014,25 @@ class _HomePageState extends State<HomePage> {
           ),
 
           const SizedBox(height: 10),
+          ListTile(
+            leading: const Icon(Icons.privacy_tip_outlined, color: Colors.blue),
+            title: const Text(
+              'Privacy Policy',
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+            trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+            onTap: () async {
+              final uri = Uri.parse('https://india.flashcarts.in/privacy');
+              if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+                if (!context.mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Privacy Policy लिंक अभी खुल नहीं सका।'),
+                  ),
+                );
+              }
+            },
+          ),
 
           _profileTile(
             Icons.logout_rounded,
@@ -3456,59 +4060,22 @@ class _HomePageState extends State<HomePage> {
 
   Widget _profileTile(
     IconData icon,
-
     String title,
-
     String subtitle,
-
     VoidCallback onTap, {
     bool danger = false,
   }) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-
-        borderRadius: BorderRadius.circular(18),
-      ),
-
-      child: ListTile(
-        onTap: onTap,
-        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 3),
-
-        leading: Container(
-          padding: const EdgeInsets.all(10),
-
-          decoration: BoxDecoration(
-            color: danger
-                ? Colors.red.withOpacity(0.08)
-                : const Color(0xFFFFEBEE),
-
-            borderRadius: BorderRadius.circular(12),
-          ),
-
-          child: Icon(
-            icon,
-
-            color: danger ? Colors.red : const Color(0xFFE53935),
-          ),
+    return ListTile(
+      onTap: onTap,
+      leading: Icon(icon, color: danger ? Colors.red : Colors.blue),
+      title: Text(
+        title,
+        style: TextStyle(
+          fontWeight: FontWeight.w600,
+          color: danger ? Colors.red : Colors.black87,
         ),
-
-        title: Text(
-          title,
-
-          style: TextStyle(
-            fontWeight: FontWeight.w800,
-
-            fontSize: 16,
-
-            color: danger ? Colors.red : Colors.black87,
-          ),
-        ),
-
-        subtitle: Text(subtitle),
-
-        trailing: const Icon(Icons.arrow_forward_ios_rounded, size: 16),
       ),
+      trailing: const Icon(Icons.arrow_forward_ios, size: 16),
     );
   }
 
@@ -4043,136 +4610,98 @@ class _PhoneAuthPageState extends State<PhoneAuthPage> {
 
   final FirebaseAuth _auth = FirebaseAuth.instance;
 
-  String _verificationId = '';
-
   bool _isOtpSent = false;
 
   bool _isLoading = false;
 
-  // ====================================================
-  // SEND OTP
-  // ====================================================
+  static const String _otpApiBase =
+      'https://throbbing-waterfall-7763.flashcartyouth553.workers.dev';
 
-  Future<void> _sendOtp() async {
-    final phone = _phoneController.text.trim();
-
-    if (phone.length != 10) {
-      _showError('कृ पया 10 अंकों का मोबाइल नंबर डालें');
-
-      return;
-    }
-
-    setState(() {
-      _isLoading = true;
-    });
-
-    final phoneNumber = '+91$phone';
-
+  Future<Map<String, dynamic>> _postOtp(
+    String path,
+    Map<String, String> body,
+  ) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 20);
     try {
-      await _auth.verifyPhoneNumber(
-        phoneNumber: phoneNumber,
-
-        verificationCompleted: (PhoneAuthCredential credential) async {
-          try {
-            await _auth.signInWithCredential(credential);
-
-            if (mounted) {
-              _showSuccess('Login successful        🎉');
-            }
-          } catch (e) {
-            _showError('Login नहीं हो पाया');
-          }
-        },
-
-        verificationFailed: (FirebaseAuthException e) {
-          if (!mounted) return;
-
-          setState(() {
-            _isLoading = false;
-          });
-
-          _showError(e.message ?? 'OTP भेजने में समस्या हुई');
-        },
-
-        codeSent: (String verificationId, int? resendToken) {
-          if (!mounted) return;
-
-          setState(() {
-            _isLoading = false;
-            _isOtpSent = true;
-
-            _verificationId = verificationId;
-          });
-
-          _showSuccess('OTP भेज दिया गया है   📱');
-        },
-
-        codeAutoRetrievalTimeout: (String verificationId) {
-          _verificationId = verificationId;
-        },
+      final request = await client.postUrl(Uri.parse('$_otpApiBase$path'));
+      request.headers.contentType = ContentType.json;
+      request.write(jsonEncode(body));
+      final response = await request.close().timeout(
+        const Duration(seconds: 25),
       );
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        _isLoading = false;
-      });
-
-      _showError('कु छ समस्या हुई। फिर से कोशिश करें।');
+      final responseText = await response.transform(utf8.decoder).join();
+      Map<String, dynamic> data;
+      try {
+        data = jsonDecode(responseText) as Map<String, dynamic>;
+      } catch (_) {
+        throw Exception('Server से सही response नहीं मिला।');
+      }
+      if (response.statusCode < 200 ||
+          response.statusCode >= 300 ||
+          data['ok'] != true) {
+        throw Exception((data['error'] ?? 'Request असफल हुआ।').toString());
+      }
+      return data;
+    } on SocketException {
+      throw Exception('Internet connection जाँचें और फिर कोशिश करें।');
+    } on HttpException {
+      throw Exception('OTP server से संपर्क नहीं हो पाया।');
+    } on TimeoutException {
+      throw Exception('Server ने जवाब देने में समय लिया। फिर कोशिश करें।');
+    } finally {
+      client.close(force: true);
     }
   }
 
-  // ====================================================
-
-  // VERIFY OTP
-  // ====================================================
-
-  Future<void> _verifyOtp() async {
-    final otp = _otpController.text.trim();
-
-    if (otp.length != 6) {
-      _showError('कृ पया 6 अंकों का OTP डालें');
-
+  // WhatsApp OTP भेजें
+  Future<void> _sendOtp() async {
+    final phone = _phoneController.text.trim();
+    if (!RegExp(r'^[6-9]\d{9}$').hasMatch(phone)) {
+      _showError('कृपया सही 10 अंकों का भारतीय मोबाइल नंबर डालें');
       return;
     }
-
-    if (_verificationId.isEmpty) {
-      _showError('पहले OTP भेजें');
-
-      return;
-    }
-
-    setState(() {
-      _isLoading = true;
-    });
-
+    setState(() => _isLoading = true);
     try {
-      final credential = PhoneAuthProvider.credential(
-        verificationId: _verificationId,
-
-        smsCode: otp,
-      );
-
-      await _auth.signInWithCredential(credential);
-
+      await _postOtp('/auth/send-otp', {'phone': phone});
       if (!mounted) return;
-
-      _showSuccess('Login successful     🎉');
-    } on FirebaseAuthException catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        _isLoading = false;
-      });
-
-      _showError(e.message ?? 'गलत OTP है');
+      setState(() => _isOtpSent = true);
+      _showSuccess('WhatsApp पर OTP भेज दिया गया है।');
     } catch (e) {
       if (!mounted) return;
+      _showError(e.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
 
-      setState(() {
-        _isLoading = false;
+  // WhatsApp OTP verify करके Firebase custom-token session शुरू करें
+  Future<void> _verifyOtp() async {
+    final phone = _phoneController.text.trim();
+    final otp = _otpController.text.trim();
+    if (!RegExp(r'^\d{6}$').hasMatch(otp)) {
+      _showError('कृपया 6 अंकों का OTP डालें');
+      return;
+    }
+    setState(() => _isLoading = true);
+    try {
+      final data = await _postOtp('/auth/verify-otp', {
+        'phone': phone,
+        'otp': otp,
       });
-      _showError('OTP verification failed');
+      final token = (data['firebaseCustomToken'] ?? '').toString();
+      if (token.isEmpty) throw Exception('Login token नहीं मिला।');
+      await _auth.signInWithCustomToken(token);
+      if (!mounted) return;
+      _showSuccess('WhatsApp से Login सफल हुआ 🎉');
+    } on FirebaseAuthException catch (e) {
+      if (!mounted) return;
+      _showError(e.message ?? 'Firebase login नहीं हो पाया।');
+    } catch (e) {
+      if (!mounted) return;
+      _showError(e.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -4239,7 +4768,9 @@ class _PhoneAuthPageState extends State<PhoneAuthPage> {
 
               const SizedBox(height: 25),
               Text(
-                _isOtpSent ? 'Enter OTP        🔐' : 'Welcome to FlashCart 👋',
+                _isOtpSent
+                    ? 'WhatsApp OTP        🔐'
+                    : 'Welcome to FlashCart 👋',
                 style: const TextStyle(
                   fontSize: 26,
 
@@ -4253,8 +4784,8 @@ class _PhoneAuthPageState extends State<PhoneAuthPage> {
 
               Text(
                 _isOtpSent
-                    ? 'आपके मोबाइल नंबर पर भेजा गया OTP डालें'
-                    : 'मोबाइल नंबर से जल्दी Login करें',
+                    ? 'आपके WhatsApp पर भेजा गया OTP डालें'
+                    : 'WhatsApp OTP से जल्दी Login करें',
 
                 style: const TextStyle(color: Colors.grey, fontSize: 15),
 
@@ -4334,7 +4865,7 @@ class _PhoneAuthPageState extends State<PhoneAuthPage> {
                     ),
                   ),
                   child: const Text(
-                    'Send OTP',
+                    'Send WhatsApp OTP',
 
                     style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
                   ),
@@ -4406,7 +4937,7 @@ class _PhoneAuthPageState extends State<PhoneAuthPage> {
                   ),
 
                   child: const Text(
-                    'Verify OTP',
+                    'Verify & Login',
                     style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
                   ),
                 ),
@@ -4518,10 +5049,23 @@ class _CheckoutPageState extends State<CheckoutPage> {
     return total;
   }
 
-  // Checkout fees: delivery is free; handling and packaging remain fixed.
-  double get handlingProcessingFee => 9.0;
+  double get handlingProcessingFee {
+    if (itemsTotal < 69) return 4.0;
+    if (itemsTotal <= 349) return 6.0;
+    return 0.0;
+  }
 
-  double get packagingFee => 7.0;
+  double get packagingFee {
+    if (itemsTotal < 69) return 4.0;
+    if (itemsTotal <= 349) return 5.0;
+    return 0.0;
+  }
+
+  double get platformFee {
+    if (itemsTotal < 69) return 3.0;
+    if (itemsTotal <= 349) return 4.0;
+    return 0.0;
+  }
 
   double get deliveryFee => 0.0;
 
@@ -4530,6 +5074,7 @@ class _CheckoutPageState extends State<CheckoutPage> {
         itemsTotal +
         handlingProcessingFee +
         packagingFee +
+        platformFee +
         deliveryFee -
         offerDiscount;
     return value < 0 ? 0 : value;
@@ -4745,24 +5290,43 @@ class _CheckoutPageState extends State<CheckoutPage> {
         return;
       }
 
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-        ),
-      );
+      // 1. पहले फोन की हालिया (2 मिनट के अंदर की) लोकेशन तुरंत चेक करें (0.1 सेकंड में)
+      Position? position;
+      final lastKnown = await Geolocator.getLastKnownPosition();
+      if (lastKnown != null &&
+          DateTime.now().difference(lastKnown.timestamp).inMinutes < 2) {
+        position = lastKnown;
+      } else {
+        // 2. तेज़ नेटवर्क/GPS लॉक (LocationAccuracy.medium + 4 सेकंड टाइमआउट)
+        try {
+          position = await Geolocator.getCurrentPosition(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.medium,
+              timeLimit: Duration(seconds: 4),
+            ),
+          );
+        } catch (_) {
+          // अगर 4 सेकंड में नया सिग्नल न मिले तो पिछली उपलब्ध लोकेशन ले लें
+          position =
+              lastKnown ??
+              await Geolocator.getCurrentPosition(
+                locationSettings: const LocationSettings(
+                  accuracy: LocationAccuracy.low,
+                  timeLimit: Duration(seconds: 3),
+                ),
+              );
+        }
+      }
 
-      // Convert GPS coordinates into a readable address and autofill the
-      // address fields. Name and mobile number are deliberately untouched.
+      // 3. Reverse Geocoding पर भी 3 सेकंड का फास्ट टाइमआउट लगाएं
       List<Placemark> placemarks = <Placemark>[];
       try {
         final geocodingService = Geocoding();
-        placemarks = await geocodingService.placemarkFromCoordinates(
-          position.latitude,
-          position.longitude,
-        );
+        placemarks = await geocodingService
+            .placemarkFromCoordinates(position.latitude, position.longitude)
+            .timeout(const Duration(seconds: 3));
       } catch (_) {
-        // GPS coordinates can still be saved if reverse geocoding is
-        // unavailable or the network/geocoding service fails.
+        // नेटवर्क धीमा होने पर भी GPS coordinates तुरंत सेव हो जाएंगे
       }
 
       if (!mounted) return;
@@ -4794,12 +5358,10 @@ class _CheckoutPageState extends State<CheckoutPage> {
       final readablePin = place?.postalCode?.trim() ?? '';
 
       setState(() {
-        savedLatitude = position.latitude;
+        savedLatitude = position!.latitude;
         savedLongitude = position.longitude;
         savedLocationAt = position.timestamp;
 
-        // Only replace address values when geocoding returned real data;
-        // never insert placeholders such as "Na" or overwrite with blanks.
         if (readableAddress.isNotEmpty) {
           addressController.text = readableAddress;
         }
@@ -5020,31 +5582,41 @@ class _CheckoutPageState extends State<CheckoutPage> {
                       SizedBox(
                         width: double.infinity,
                         height: 46,
-                        child: ElevatedButton.icon(
-                          onPressed: isGettingLocation
-                              ? null
-                              : useCurrentLocation,
-                          icon: isGettingLocation
-                              ? const SizedBox(
-                                  width: 18,
-                                  height: 18,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                  ),
-                                )
-                              : const Icon(Icons.my_location_rounded),
-                          label: Text(
-                            isGettingLocation
-                                ? 'Getting location...'
-                                : savedLatitude != null
-                                ? 'Update Current Location'
-                                : 'Use Current Location',
-                          ),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF188A42),
-                            foregroundColor: Colors.white,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(13),
+                        child: ContinuousColorBorderBox(
+                          isGradientFill: true,
+                          borderRadius: 13,
+                          child: ElevatedButton.icon(
+                            onPressed: isGettingLocation
+                                ? null
+                                : useCurrentLocation,
+                            icon: isGettingLocation
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : const Icon(Icons.my_location_rounded),
+                            label: Text(
+                              isGettingLocation
+                                  ? 'Getting location...'
+                                  : savedLatitude != null
+                                  ? 'Update Current Location'
+                                  : 'Use Current Location',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.transparent,
+                              shadowColor: Colors.transparent,
+                              disabledBackgroundColor: Colors.black26,
+                              foregroundColor: Colors.white,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(13),
+                              ),
                             ),
                           ),
                         ),
@@ -5238,6 +5810,24 @@ class _CheckoutPageState extends State<CheckoutPage> {
   // ====================================================
 
   Future<void> placeOrder() async {
+    // Freeze the applied coupon before any asynchronous branch/payment calls.
+    // This prevents a rebuild or auth refresh from sending an empty coupon while
+    // the checkout UI still displays the applied offer.
+    final checkoutOfferCode = appliedOfferCode.trim().toUpperCase();
+    final checkoutOfferName = appliedOfferName;
+    final checkoutOfferPercent = appliedOfferPercent;
+    final checkoutOfferDiscount = checkoutOfferPercent <= 0
+        ? 0.0
+        : (itemsTotal * checkoutOfferPercent / 100).clamp(0.0, itemsTotal);
+    final checkoutItemsTotal = itemsTotal;
+    final checkoutGrandTotal =
+        (checkoutItemsTotal +
+                handlingProcessingFee +
+                packagingFee +
+                platformFee +
+                deliveryFee -
+                checkoutOfferDiscount)
+            .clamp(0.0, double.infinity);
     // CEO-controlled order availability: check fresh server config before checkout.
     try {
       final availabilityDoc = await FirebaseFirestore.instance
@@ -5339,18 +5929,6 @@ class _CheckoutPageState extends State<CheckoutPage> {
       return;
     }
 
-    if (paymentMethod != 'Cash on Delivery') {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Online payment will be available soon. Please select Cash on Delivery.',
-          ),
-        ),
-      );
-
-      return;
-    }
-
     if (widget.items.isEmpty) {
       ScaffoldMessenger.of(context)
           .showSnackBar(const SnackBar(content: Text('Your cart is empty')));
@@ -5426,58 +6004,155 @@ class _CheckoutPageState extends State<CheckoutPage> {
         };
       }).toList();
 
-      // Create the order and a small delivery-queue record together.
-      // The queue record lets the delivery app claim new orders directly
-      // without requiring the Admin app to be logged in.
+      // Save the order snapshot. COD is placed by the trusted Function; online
+      // orders are created only after Cashfree confirms payment server-side.
       final db = FirebaseFirestore.instance;
+      // Generate a plain Firestore ID. Online payment remains pending until
+      // Firebase Cloud Functions verifies the Cashfree payment.
       final orderRef = db.collection('orders').doc();
-      final queueRef = db.collection('deliveryQueue').doc(orderRef.id);
-
-      final batch = db.batch();
-      batch.set(orderRef, {
+      final orderData = <String, dynamic>{
         'orderId': orderRef.id,
         'userId': currentUser.uid,
-        'userPhone': currentUser.phoneNumber ?? savedPhone,
+        'userPhone': () {
+          final rawPhone = (currentUser.phoneNumber ?? savedPhone).trim();
+          if (rawPhone.isNotEmpty) return rawPhone;
+          final digits = currentUser.uid.replaceAll(RegExp(r'\D'), '');
+          return digits.length >= 10
+              ? digits.substring(digits.length - 10)
+              : digits;
+        }(),
+
         'customerName': savedName,
         'items': orderItems,
-        'itemsTotal': itemsTotal,
+        'itemsTotal': checkoutItemsTotal,
         'handlingProcessingFee': handlingProcessingFee,
         'packagingFee': packagingFee,
+        'platformFee': platformFee,
         'deliveryFee': deliveryFee,
-        'discountAmount': offerDiscount,
-        'discountPercent': appliedOfferPercent,
-        'appliedOfferCode': appliedOfferCode,
-        'appliedOfferName': appliedOfferName,
-        'totalPrice': grandTotal,
-        'paymentMethod': paymentMethod,
+        'discountAmount': checkoutOfferDiscount,
+        'discountPercent': checkoutOfferPercent,
+        'appliedOfferCode': checkoutOfferCode,
+        'appliedOfferName': checkoutOfferName,
+        'totalPrice': checkoutGrandTotal,
+        'paymentMethod': paymentMethod == 'Cash on Delivery'
+            ? 'Cash on Delivery'
+            : paymentMethod == 'Razorpay'
+            ? 'Razorpay'
+            : 'Cashfree',
+        'paymentStatus': paymentMethod == 'Cash on Delivery'
+            ? 'cod'
+            : 'pending',
+
         'deliveryAddress': savedAddress,
         'deliveryLatitude': savedLatitude,
         'deliveryLongitude': savedLongitude,
         'deliveryGeoPoint': GeoPoint(savedLatitude ?? 0, savedLongitude ?? 0),
         'deliveryLocationSet': true,
         'deliveryLocationUpdatedAt': FieldValue.serverTimestamp(),
-        // Branch snapshot keeps existing order fields and adds serviceability metadata.
         'branchId': serviceBranch['branchId'],
         'branchName': serviceBranch['branchName'],
         'branchLatitude': serviceBranch['branchLatitude'],
         'branchLongitude': serviceBranch['branchLongitude'],
         'serviceRadiusKm': serviceBranch['serviceRadiusKm'],
         'deliveryDistanceKm': serviceBranch['deliveryDistanceKm'],
-        'status': 'Order Placed',
+        'status': paymentMethod == 'Cash on Delivery'
+            ? 'Order Placed'
+            : 'Awaiting Payment',
+
         'orderDate': FieldValue.serverTimestamp(),
-      });
+      };
 
-      batch.set(queueRef, {
-        'orderId': orderRef.id,
-        'userId': currentUser.uid,
-        'status': 'pending',
-        'assignedPartnerId': '',
-        'branchId': serviceBranch['branchId'],
-        'branchName': serviceBranch['branchName'],
-        'createdAt': FieldValue.serverTimestamp(),
-      });
-
-      await batch.commit();
+      if (paymentMethod == 'Cash on Delivery') {
+        // COD is now placed by Firebase Functions. Server recalculates prices,
+        // validates branch radius/availability/offer, and atomically reserves stock.
+        final codPayload = Map<String, dynamic>.from(orderData);
+        codPayload['deliveryGeoPoint'] = {
+          'latitude': savedLatitude ?? 0,
+          'longitude': savedLongitude ?? 0,
+        };
+        codPayload['deliveryLocationUpdatedAt'] = DateTime.now()
+            .toUtc()
+            .toIso8601String();
+        codPayload['orderDate'] = DateTime.now().toUtc().toIso8601String();
+        final result = await _flashCartPaymentWorkerCall(
+          Uri.https(_flashCartPaymentHost, 'flashCartPayment/order/cod-place'),
+          {'orderId': orderRef.id, 'orderData': codPayload},
+        );
+        if (result['orderCreated'] != true) {
+          throw StateError('COD order server पर confirm नहीं हुआ।');
+        }
+      } else if (paymentMethod == 'Razorpay') {
+        final sessionData = Map<String, dynamic>.from(orderData);
+        sessionData['deliveryGeoPoint'] = {
+          'latitude': savedLatitude ?? 0,
+          'longitude': savedLongitude ?? 0,
+        };
+        final checkoutTime = DateTime.now().toUtc().toIso8601String();
+        sessionData['deliveryLocationUpdatedAt'] = checkoutTime;
+        sessionData['orderDate'] = checkoutTime;
+        final paymentConfirmed = await _startFlashCartNativePayment(
+          orderId: orderRef.id,
+          orderData: sessionData,
+        );
+        if (!mounted) return;
+        if (paymentConfirmed) {
+          widget.onOrderPlaced();
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (_) => OrderSuccessPage(orderId: orderRef.id),
+            ),
+          );
+          return;
+        }
+        setState(() => isPlacingOrder = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Razorpay Payment अभी Verify नहीं हुआ। सफल Verification के बाद ही Order बनेगा।',
+            ),
+            duration: Duration(seconds: 7),
+          ),
+        );
+        return;
+      } else {
+        // Online checkout creates only a private payment session. The Worker
+        // creates orders/{id} and deliveryQueue/{id} after the signed
+        // Razorpay payment_link.paid webhook confirms the exact amount.
+        final sessionData = Map<String, dynamic>.from(orderData);
+        sessionData['deliveryGeoPoint'] = {
+          'latitude': savedLatitude ?? 0,
+          'longitude': savedLongitude ?? 0,
+        };
+        final checkoutTime = DateTime.now().toUtc().toIso8601String();
+        sessionData['deliveryLocationUpdatedAt'] = checkoutTime;
+        sessionData['orderDate'] = checkoutTime;
+        final paymentConfirmed = await _startFlashCartCashfreePayment(
+          orderId: orderRef.id,
+          orderData: sessionData,
+        );
+        if (!mounted) return;
+        if (paymentConfirmed) {
+          widget.onOrderPlaced();
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (_) => OrderSuccessPage(orderId: orderRef.id),
+            ),
+          );
+          return;
+        }
+        setState(() => isPlacingOrder = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Payment अभी Verify नहीं हुआ। भुगतान पूरा करके FlashCart में वापस आएँ; Order सफल Verification के बाद ही बनेगा।',
+            ),
+            duration: Duration(seconds: 7),
+          ),
+        );
+        return;
+      }
 
       widget.onOrderPlaced();
 
@@ -5554,92 +6229,40 @@ class _CheckoutPageState extends State<CheckoutPage> {
                 const SizedBox(height: 12),
 
                 // =================================================
-
-                // SAVED ADDRESS
-
-                // =================================================
-                Container(
-                  padding: const EdgeInsets.all(16),
-
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-
-                    borderRadius: BorderRadius.circular(18),
-                  ),
-                  child: savedAddress.isEmpty
-                      ? InkWell(
+                savedAddress.isEmpty
+                    ? ContinuousColorBorderBox(
+                        borderRadius: 18,
+                        child: InkWell(
                           onTap: showAddressSheet,
-
-                          child: const Row(
-                            children: [
-                              Icon(Icons.location_on, color: Color(0xFFE53935)),
-
-                              SizedBox(width: 12),
-
-                              Expanded(
-                                child: Text(
-                                  'Add your delivery address',
-                                  style: TextStyle(fontWeight: FontWeight.w600),
-                                ),
-                              ),
-
-                              Icon(Icons.arrow_forward_ios, size: 16),
-                            ],
-                          ),
-                        )
-                      : Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
+                          borderRadius: BorderRadius.circular(15.5),
+                          child: const Padding(
+                            padding: EdgeInsets.all(16),
+                            child: Row(
                               children: [
-                                const Icon(
+                                Icon(
                                   Icons.location_on,
-
                                   color: Color(0xFFE53935),
                                 ),
-
-                                const SizedBox(width: 8),
-
-                                const Expanded(
+                                SizedBox(width: 12),
+                                Expanded(
                                   child: Text(
-                                    'Delivery Address',
-
+                                    'Add your delivery address',
                                     style: TextStyle(
-                                      fontWeight: FontWeight.bold,
-
-                                      fontSize: 17,
+                                      fontWeight: FontWeight.w600,
+                                      fontSize: 15.5,
                                     ),
                                   ),
                                 ),
-
-                                TextButton(
-                                  onPressed: showAddressSheet,
-
-                                  child: const Text(
-                                    'Change',
-
-                                    style: TextStyle(
-                                      color: Color(0xFFE53935),
-
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                ),
+                                Icon(Icons.arrow_forward_ios, size: 16),
                               ],
                             ),
-
-                            const Divider(),
-
-                            const SizedBox(height: 5),
-
-                            Text(
-                              savedAddress,
-
-                              style: const TextStyle(fontSize: 15, height: 1.5),
-                            ),
-                          ],
+                          ),
                         ),
-                ),
+                      )
+                    : AnimatedDeliverySection(
+                        addressText: savedAddress,
+                        onChangeTap: showAddressSheet,
+                      ),
 
                 const SizedBox(height: 14),
 
@@ -5684,36 +6307,45 @@ class _CheckoutPageState extends State<CheckoutPage> {
                     color: Colors.white,
                     borderRadius: BorderRadius.circular(16),
                   ),
-
                   child: Column(
                     children: [
                       RadioListTile<String>(
-                        value: 'Cash on Delivery',
-
+                        value: 'Razorpay',
                         groupValue: paymentMethod,
-
+                        activeColor: const Color(0xFFE53935),
+                        onChanged: (value) {
+                          if (value != null) {
+                            setState(() => paymentMethod = value);
+                          }
+                        },
+                        title: const Text('Online Payment (Razorpay)'),
+                        secondary: const Icon(Icons.payment_outlined),
+                      ),
+                      const Divider(height: 1),
+                      RadioListTile<String>(
+                        value: 'Online Payment',
+                        groupValue: paymentMethod,
+                        onChanged: (value) {
+                          if (value != null) {
+                            setState(() => paymentMethod = value);
+                          }
+                        },
+                        title: const Text('Online Payment (Cashfree)'),
+                        secondary: const Icon(
+                          Icons.account_balance_wallet_outlined,
+                        ),
+                      ),
+                      const Divider(height: 1),
+                      RadioListTile<String>(
+                        value: 'Cash on Delivery',
+                        groupValue: paymentMethod,
                         onChanged: (value) {
                           setState(() {
                             paymentMethod = value!;
                           });
                         },
-
                         title: const Text('Cash on Delivery'),
-
                         secondary: const Icon(Icons.payments_outlined),
-                      ),
-
-                      RadioListTile<String>(
-                        value: 'Online Payment',
-
-                        groupValue: paymentMethod,
-                        onChanged: null,
-
-                        title: const Text('Online Payment (Coming soon)'),
-
-                        secondary: const Icon(
-                          Icons.account_balance_wallet_outlined,
-                        ),
                       ),
                     ],
                   ),
@@ -5772,7 +6404,7 @@ class _CheckoutPageState extends State<CheckoutPage> {
                             child: FilledButton(
                               onPressed: offerChecking ? null : applyOffer,
                               style: FilledButton.styleFrom(
-                                backgroundColor: const Color(0xFFE53935),
+                                backgroundColor: Colors.blue,
                                 foregroundColor: Colors.white,
                               ),
                               child: offerChecking
@@ -5862,7 +6494,19 @@ class _CheckoutPageState extends State<CheckoutPage> {
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
                           const Text('Handling & Processing Fee'),
-                          Text('₹${handlingProcessingFee.toStringAsFixed(0)}'),
+                          Text(
+                            handlingProcessingFee == 0
+                                ? 'FREE'
+                                : '₹${handlingProcessingFee.toStringAsFixed(0)}',
+                            style: TextStyle(
+                              color: handlingProcessingFee == 0
+                                  ? Colors.green
+                                  : Colors.black87,
+                              fontWeight: handlingProcessingFee == 0
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                            ),
+                          ),
                         ],
                       ),
 
@@ -5872,7 +6516,41 @@ class _CheckoutPageState extends State<CheckoutPage> {
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
                           const Text('Packaging Fee'),
-                          Text('₹${packagingFee.toStringAsFixed(0)}'),
+                          Text(
+                            packagingFee == 0
+                                ? 'FREE'
+                                : '₹${packagingFee.toStringAsFixed(0)}',
+                            style: TextStyle(
+                              color: packagingFee == 0
+                                  ? Colors.green
+                                  : Colors.black87,
+                              fontWeight: packagingFee == 0
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      const SizedBox(height: 10),
+
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('Platform Fee'),
+                          Text(
+                            platformFee == 0
+                                ? 'FREE'
+                                : '₹${platformFee.toStringAsFixed(0)}',
+                            style: TextStyle(
+                              color: platformFee == 0
+                                  ? Colors.green
+                                  : Colors.black87,
+                              fontWeight: platformFee == 0
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                            ),
+                          ),
                         ],
                       ),
 
@@ -5950,8 +6628,8 @@ class _CheckoutPageState extends State<CheckoutPage> {
                     onPressed: isPlacingOrder ? null : placeOrder,
 
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFFE53935),
-                      foregroundColor: Colors.white,
+                      backgroundColor: Colors.yellow,
+                      foregroundColor: Colors.black,
                     ),
 
                     child: isPlacingOrder
@@ -5965,12 +6643,12 @@ class _CheckoutPageState extends State<CheckoutPage> {
                               strokeWidth: 2,
                             ),
                           )
-                        : const Text(
-                            'Place Order',
-
-                            style: TextStyle(
+                        : Text(
+                            paymentMethod == 'Online Payment'
+                                ? 'Pay Now ₹${grandTotal.toStringAsFixed(0)}'
+                                : 'Place Order',
+                            style: const TextStyle(
                               fontSize: 17,
-
                               fontWeight: FontWeight.bold,
                             ),
                           ),
@@ -6456,6 +7134,47 @@ class MyOrdersPage extends StatelessWidget {
             ),
           ],
 
+          if ((payment.toLowerCase() == 'razorpay' ||
+                  payment.toLowerCase() == 'cashfree') &&
+              (data['paymentStatus'] ?? 'pending').toString().toLowerCase() !=
+                  'paid' &&
+              status.toLowerCase() != 'cancelled') ...[
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              height: 46,
+              child: ElevatedButton.icon(
+                onPressed: () => payment.toLowerCase() == 'cashfree'
+                    ? retryCashfreePayment(context, documentId)
+                    : retryRazorpayPayment(context, documentId),
+                icon: const Icon(Icons.lock_rounded),
+                label: const Text(
+                  'Pay Now / Retry Payment',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF188A42),
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              height: 42,
+              child: OutlinedButton.icon(
+                onPressed: () => payment.toLowerCase() == 'cashfree'
+                    ? checkCashfreePayment(context, documentId)
+                    : checkRazorpayPayment(context, documentId),
+                icon: const Icon(Icons.refresh_rounded),
+                label: const Text('Check Payment Status'),
+              ),
+            ),
+          ],
+
           const SizedBox(height: 16),
 
           SizedBox(
@@ -6482,8 +7201,7 @@ class MyOrdersPage extends StatelessWidget {
               ),
 
               style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFE53935),
-
+                backgroundColor: Colors.green,
                 foregroundColor: Colors.white,
 
                 shape: RoundedRectangleBorder(
@@ -6525,31 +7243,315 @@ class MyOrdersPage extends StatelessWidget {
     );
   }
 
+  Map<String, dynamic> _paymentSafeOrderData(Map<String, dynamic> source) {
+    dynamic clean(dynamic value) {
+      if (value is Timestamp) return value.toDate().toUtc().toIso8601String();
+      if (value is GeoPoint) {
+        return {'latitude': value.latitude, 'longitude': value.longitude};
+      }
+      if (value is DateTime) return value.toUtc().toIso8601String();
+      if (value is Map) {
+        return value.map((key, val) => MapEntry(key.toString(), clean(val)));
+      }
+      if (value is Iterable) return value.map(clean).toList();
+      return value;
+    }
+
+    return Map<String, dynamic>.from(clean(source) as Map);
+  }
+
+  Future<void> retryCashfreePayment(
+    BuildContext context,
+    String documentId,
+  ) async {
+    try {
+      if (!RegExp(r'^[A-Za-z0-9_-]{8,80}$').hasMatch(documentId)) {
+        throw StateError(
+          'Order ID गलत है; JSON data को document ID नहीं बनाया जा सकता।',
+        );
+      }
+      final currentUser = FirebaseAuth.instance.currentUser;
+      if (currentUser == null) throw StateError('कृपया दोबारा login करें।');
+      if (!RegExp(r'^[A-Za-z0-9_-]{8,80}$').hasMatch(documentId)) {
+        throw StateError('Order ID गलत है।');
+      }
+
+      Map<String, dynamic>? paymentData;
+      final orderSnap = await FirebaseFirestore.instance
+          .collection('orders')
+          .doc(documentId)
+          .get(const GetOptions(source: Source.server));
+      final order = orderSnap.data();
+      if (orderSnap.exists && order != null) {
+        if (order['userId']?.toString() != currentUser.uid) {
+          throw StateError('Order access अनुमति नहीं है।');
+        }
+        paymentData = _paymentSafeOrderData(order);
+      } else {
+        final sessionSnap = await FirebaseFirestore.instance
+            .collection('cashfreePaymentSessions')
+            .doc(documentId)
+            .get(const GetOptions(source: Source.server));
+        final session = sessionSnap.data();
+        if (!sessionSnap.exists ||
+            session == null ||
+            session['userId']?.toString() != currentUser.uid) {
+          throw StateError('Pending Cashfree payment session नहीं मिली।');
+        }
+        if (session['status']?.toString().toLowerCase() == 'paid' ||
+            session['paymentStatus']?.toString().toLowerCase() == 'paid') {
+          throw StateError('इस order का payment पहले ही सफल हो चुका है।');
+        }
+        final storedOrder = session['orderData'];
+        if (storedOrder is! Map) {
+          throw StateError('Payment session में order details नहीं मिलीं।');
+        }
+        paymentData = _paymentSafeOrderData(
+          Map<String, dynamic>.from(storedOrder),
+        );
+      }
+
+      if (paymentData['paymentMethod']?.toString().toLowerCase() !=
+              'cashfree' ||
+          paymentData['paymentStatus']?.toString().toLowerCase() == 'paid' ||
+          paymentData['status']?.toString().toLowerCase() == 'cancelled') {
+        throw StateError(
+          'इस order के लिए Cashfree payment दोबारा नहीं किया जा सकता।',
+        );
+      }
+
+      final paid = await _startFlashCartCashfreePayment(
+        orderId: documentId,
+        orderData: paymentData,
+      );
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            paid
+                ? 'Cashfree Payment सफलतापूर्वक verify हो गया।'
+                : 'Payment अभी verify नहीं हुआ। कुछ देर बाद status जाँचें।',
+          ),
+          backgroundColor: paid ? const Color(0xFF188A42) : Colors.orange,
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Cashfree Payment शुरू/Verify नहीं हुआ: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<void> checkCashfreePayment(
+    BuildContext context,
+    String documentId,
+  ) async {
+    try {
+      if (!RegExp(r'^[A-Za-z0-9_-]{8,80}$').hasMatch(documentId)) {
+        throw StateError(
+          'Order ID गलत है; JSON data को document ID नहीं बनाया जा सकता।',
+        );
+      }
+      if (FirebaseAuth.instance.currentUser == null) {
+        throw StateError('कृपया login करें।');
+      }
+      final result = await _flashCartPaymentWorkerCall(
+        Uri.https(_flashCartPaymentHost, 'cashfreePayment/payment/verify'),
+        {'orderId': documentId},
+      );
+      if (!context.mounted) return;
+      final paid =
+          result['paymentStatus']?.toString().toLowerCase() == 'paid' &&
+          result['orderCreated'] == true;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            paid
+                ? 'Cashfree Payment सफलतापूर्वक verify हो गया।'
+                : 'Payment Status: ${result['paymentStatus'] ?? 'pending'}',
+          ),
+          backgroundColor: paid ? const Color(0xFF188A42) : Colors.orange,
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Payment Status नहीं मिला: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<void> retryRazorpayPayment(
+    BuildContext context,
+    String documentId,
+  ) async {
+    try {
+      final currentUser = FirebaseAuth.instance.currentUser;
+      if (currentUser == null) throw StateError('कृपया दोबारा login करें।');
+      if (!RegExp(r'^[A-Za-z0-9_-]{8,80}$').hasMatch(documentId)) {
+        throw StateError('Order ID गलत है।');
+      }
+
+      // New Blaze checkout creates paymentSessions/{orderId} first. The final
+      // orders/{orderId} document is created only after Razorpay capture.
+      // Older pending orders may still exist in orders, so support both.
+      Map<String, dynamic>? paymentData;
+      final orderSnap = await FirebaseFirestore.instance
+          .collection('orders')
+          .doc(documentId)
+          .get(const GetOptions(source: Source.server));
+      final order = orderSnap.data();
+      if (orderSnap.exists && order != null) {
+        if (order['userId']?.toString() != currentUser.uid) {
+          throw StateError('Order access अनुमति नहीं है।');
+        }
+        paymentData = _paymentSafeOrderData(order);
+      } else {
+        final sessionSnap = await FirebaseFirestore.instance
+            .collection('paymentSessions')
+            .doc(documentId)
+            .get(const GetOptions(source: Source.server));
+        final session = sessionSnap.data();
+        if (!sessionSnap.exists ||
+            session == null ||
+            session['userId']?.toString() != currentUser.uid) {
+          throw StateError('Pending payment session नहीं मिली।');
+        }
+        if (session['status']?.toString().toLowerCase() == 'paid' ||
+            session['paymentStatus']?.toString().toLowerCase() == 'paid') {
+          throw StateError('इस order का payment पहले ही सफल हो चुका है।');
+        }
+        final storedOrder = session['orderData'];
+        if (storedOrder is! Map) {
+          throw StateError('Payment session में order details नहीं मिलीं।');
+        }
+        paymentData = _paymentSafeOrderData(
+          Map<String, dynamic>.from(storedOrder),
+        );
+      }
+
+      if (paymentData['paymentMethod']?.toString().toLowerCase() !=
+              'razorpay' ||
+          paymentData['paymentStatus']?.toString().toLowerCase() == 'paid' ||
+          paymentData['status']?.toString().toLowerCase() == 'cancelled') {
+        throw StateError('इस order के लिए payment दोबारा नहीं किया जा सकता।');
+      }
+
+      final paid = await _startFlashCartNativePayment(
+        orderId: documentId,
+        orderData: paymentData,
+      );
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            paid
+                ? 'Payment सफलतापूर्वक verify हो गया।'
+                : 'Payment अभी verify नहीं हुआ। कुछ देर बाद status जाँचें।',
+          ),
+          backgroundColor: paid ? const Color(0xFF188A42) : Colors.orange,
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Payment शुरू/Verify नहीं हुआ: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<void> checkRazorpayPayment(
+    BuildContext context,
+    String documentId,
+  ) async {
+    try {
+      final currentUser = FirebaseAuth.instance.currentUser;
+      if (currentUser == null) throw StateError('कृपया login करें।');
+      if (!RegExp(r'^[A-Za-z0-9_-]{8,80}$').hasMatch(documentId)) {
+        throw StateError('Order ID गलत है।');
+      }
+
+      var paid = false;
+      final orderSnap = await FirebaseFirestore.instance
+          .collection('orders')
+          .doc(documentId)
+          .get(const GetOptions(source: Source.server));
+      final order = orderSnap.data();
+      if (orderSnap.exists && order != null) {
+        if (order['userId']?.toString() != currentUser.uid) {
+          throw StateError('Order access अनुमति नहीं है।');
+        }
+        paid =
+            order['paymentStatus']?.toString().toLowerCase() == 'paid' ||
+            order['status']?.toString().toLowerCase() == 'order placed';
+      } else {
+        final sessionSnap = await FirebaseFirestore.instance
+            .collection('paymentSessions')
+            .doc(documentId)
+            .get(const GetOptions(source: Source.server));
+        final session = sessionSnap.data();
+        if (!sessionSnap.exists ||
+            session == null ||
+            session['userId']?.toString() != currentUser.uid) {
+          throw StateError('Payment session नहीं मिली।');
+        }
+        paid =
+            session['paymentStatus']?.toString().toLowerCase() == 'paid' ||
+            session['status']?.toString().toLowerCase() == 'paid';
+      }
+
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            paid ? 'Payment verified ✓ आपका Order confirm है।' : 'Payment अभी verify नहीं हुआ है। भुगतान पूरा होने के बाद फिर जाँचें।',
+          ),
+          backgroundColor: paid ? const Color(0xFF188A42) : null,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Payment status नहीं मिला: $e')));
+    }
+  }
+
   Future<void> cancelOrder(BuildContext context, String documentId) async {
     final confirmed = await showDialog<bool>(
       context: context,
-
       builder: (dialogContext) => AlertDialog(
-        title: const Text('Cancel Order?'),
-
-        content: const Text('Are you sure you want to cancel this order?'),
-
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        title: const Text(
+          'Cancel Order?',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        content: const Text(
+          'क्या आप वाकई इस ऑर्डर को कैंसिल करना चाहते हैं?\n\nनोट: ऑर्डर कैंसिल करने पर केवल सामान (Items) की राशि ही आपके मूल बैंक/UPI खाते में 3–5 कार्यदिवसों में रिफंड होगी। Platform, Handling व Packaging फीस नॉन-रिफंडेबल है।',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('No'),
+            child: const Text('नहीं, रहने दें'),
           ),
-
           ElevatedButton(
             onPressed: () => Navigator.pop(dialogContext, true),
-
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red,
-
+              backgroundColor: const Color(0xFFE53935),
               foregroundColor: Colors.white,
             ),
-
-            child: const Text('Yes, Cancel'),
+            child: const Text('हाँ, Cancel करें'),
           ),
         ],
       ),
@@ -6557,22 +7559,33 @@ class MyOrdersPage extends StatelessWidget {
 
     if (confirmed != true) return;
 
-    try {
-      await FirebaseFirestore.instance
-          .collection('orders')
-          .doc(documentId)
-          .update({
-            'status': 'Cancelled',
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Order cancel और refund प्रोसेस हो रहा है...'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
 
-            'cancelledAt': FieldValue.serverTimestamp(),
-          });
+    try {
+      final result = await _flashCartPaymentWorkerCall(
+        Uri.https(_flashCartPaymentHost, 'cashfreePayment/order/cancel-refund'),
+        {
+          'orderId': documentId,
+          'reason': 'Cancelled by customer from My Orders',
+        },
+      );
 
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Order cancelled successfully'),
-
+          SnackBar(
+            content: Text(
+              result['message']?.toString() ??
+                  'Order सफलतापूर्वक cancel हो गया।',
+            ),
             backgroundColor: Colors.green,
+            duration: const Duration(seconds: 5),
           ),
         );
       }
@@ -6580,8 +7593,9 @@ class MyOrdersPage extends StatelessWidget {
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Order cancel नहीं हुआ: $e'),
-
+            content: Text(
+              'Order cancel नहीं हुआ: ${e.toString().replaceFirst('Exception: ', '')}',
+            ),
             backgroundColor: Colors.red,
           ),
         );
@@ -7052,16 +8066,15 @@ class OrderTrackingPage extends StatelessWidget {
                     ),
 
                     const SizedBox(height: 15),
-
                     Row(
                       children: [
                         const Icon(Icons.access_time, color: Colors.grey),
-
                         const SizedBox(width: 8),
-
-                        Text(
-                          'Estimated delivery: $estimatedDelivery',
-                          style: const TextStyle(color: Colors.grey),
+                        Expanded(
+                          child: Text(
+                            'Estimated delivery: $estimatedDelivery',
+                            style: const TextStyle(color: Colors.grey),
+                          ),
                         ),
                       ],
                     ),
@@ -7320,6 +8333,13 @@ class OrderTrackingPage extends StatelessWidget {
                 ),
               ),
 
+              const SizedBox(height: 20),
+
+              // ==================================================
+              // CANCEL ORDER & AUTO-REFUND STATUS
+              // ==================================================
+              OrderCancelAndRefundCard(orderId: orderId, data: data),
+
               const SizedBox(height: 30),
             ],
           );
@@ -7336,61 +8356,44 @@ class OrderTrackingPage extends StatelessWidget {
 
   Widget buildTrackingStep({
     required String title,
-
     required String subtitle,
-
     required IconData icon,
-
     required bool active,
-
     required bool completed,
   }) {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
-
       children: [
         Container(
           width: 48,
-
           height: 48,
-
           decoration: BoxDecoration(
             color: completed || active
-                ? const Color(0xFFFFEBEE)
+                ? Colors.green.shade50
                 : Colors.grey.shade100,
-
             shape: BoxShape.circle,
           ),
-
           child: Icon(
             completed ? Icons.check : icon,
-            color: completed || active ? const Color(0xFFE53935) : Colors.grey,
+            color: completed || active ? Colors.green : Colors.grey,
           ),
         ),
-
         const SizedBox(width: 15),
-
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
                 title,
-
                 style: TextStyle(
                   fontSize: 17,
-
                   fontWeight: FontWeight.bold,
-
                   color: completed || active ? Colors.black : Colors.grey,
                 ),
               ),
-
               const SizedBox(height: 4),
-
               Text(
                 subtitle,
-
                 style: const TextStyle(color: Colors.grey, fontSize: 13),
               ),
             ],
@@ -7409,12 +8412,9 @@ class OrderTrackingPage extends StatelessWidget {
   Widget buildLine(bool active) {
     return Container(
       margin: const EdgeInsets.only(left: 23, top: 4, bottom: 4),
-
       height: 30,
-
       width: 2,
-
-      color: active ? const Color(0xFFE53935) : Colors.grey.shade300,
+      color: active ? Colors.green : Colors.grey.shade300,
     );
   }
 
@@ -7447,5 +8447,475 @@ class OrderTrackingPage extends StatelessWidget {
 
   bool isStatusCompleted(String currentStatus, String step) {
     return statusIndex(currentStatus) >= statusIndex(step);
+  }
+}
+
+class AnimatedDeliverySection extends StatefulWidget {
+  final String addressText;
+  final VoidCallback onChangeTap;
+
+  const AnimatedDeliverySection({
+    super.key,
+    required this.addressText,
+    required this.onChangeTap,
+  });
+
+  @override
+  State<AnimatedDeliverySection> createState() =>
+      _AnimatedDeliverySectionState();
+}
+
+class _AnimatedDeliverySectionState extends State<AnimatedDeliverySection>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 4), // रंग बदलने की गति
+    )..repeat(); // लगातार चलता रहेगा
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        final double angle = _controller.value * 6.28319; // 2 * pi
+        final Color dynamicGlowColor = HSVColor.fromAHSV(
+          0.25,
+          _controller.value * 360,
+          0.85,
+          0.95,
+        ).toColor();
+
+        return Container(
+          padding: const EdgeInsets.all(2.5), // कार्ड बॉर्डर की मोटाई
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(18),
+            gradient: SweepGradient(
+              startAngle: 0.0,
+              endAngle: 6.28319,
+              transform: GradientRotation(angle),
+              colors: const [
+                Color(0xFF1E88E5), // नीला
+                Color(0xFF00C853), // हरा
+                Color(0xFFFFAB00), // सुनहरा पीला
+                Color(0xFFE53935), // कोरल लाल
+                Color(0xFF8E24AA), // बैंगनी
+                Color(0xFF1E88E5), // वापस नीला (स्मूथ लूप)
+              ],
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: dynamicGlowColor,
+                blurRadius: 14,
+                spreadRadius: 1,
+                offset: const Offset(0, 4),
+              ),
+            ],
+          ),
+          child: Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(15.5),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // ऊपरी हिस्सा: आइकन + Delivery Address + रंग बदलता Change बटन
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.location_on,
+                      color: Color(0xFFE53935),
+                      size: 22,
+                    ),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        'Delivery Address',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.black87,
+                        ),
+                      ),
+                    ),
+                    // लगातार रंग बदलने वाला Change बटन
+                    GestureDetector(
+                      onTap: widget.onChangeTap,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 7,
+                        ),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(20),
+                          gradient: LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            transform: GradientRotation(angle),
+                            colors: const [
+                              Color(0xFF1E88E5), // नीला
+                              Color(0xFF00C853), // हरा
+                              Color(0xFFFF6D00), // नारंगी
+                              Color(0xFFD81B60), // गुलाबी-लाल
+                            ],
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: dynamicGlowColor.withOpacity(0.4),
+                              blurRadius: 8,
+                              offset: const Offset(0, 2),
+                            ),
+                          ],
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.edit_location_alt_outlined,
+                              color: Colors.white,
+                              size: 14,
+                            ),
+                            SizedBox(width: 4),
+                            Text(
+                              'Change',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 12),
+                  child: Divider(height: 1, color: Color(0xFFEEEEEE)),
+                ),
+                // नीचे का हिस्सा: ग्राहक का पूरा पता
+                Text(
+                  widget.addressText,
+                  style: const TextStyle(
+                    fontSize: 14.5,
+                    height: 1.45,
+                    color: Color(0xFF333333),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class ContinuousColorBorderBox extends StatefulWidget {
+  final Widget child;
+  final double borderRadius;
+  final double borderWidth;
+  final Color innerBackgroundColor;
+  final bool
+  isGradientFill; // true करने पर पूरा बटन रंग बदलेगा, false पर सिर्फ़ बॉर्डर
+
+  const ContinuousColorBorderBox({
+    super.key,
+    required this.child,
+    this.borderRadius = 16,
+    this.borderWidth = 2.5,
+    this.innerBackgroundColor = Colors.white,
+    this.isGradientFill = false,
+  });
+
+  @override
+  State<ContinuousColorBorderBox> createState() =>
+      _ContinuousColorBorderBoxState();
+}
+
+class _ContinuousColorBorderBoxState extends State<ContinuousColorBorderBox>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 4),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        final double angle = _controller.value * 6.28319;
+        final Color dynamicGlow = HSVColor.fromAHSV(
+          0.28,
+          _controller.value * 360,
+          0.85,
+          0.95,
+        ).toColor();
+
+        return Container(
+          padding: EdgeInsets.all(
+            widget.isGradientFill ? 0 : widget.borderWidth,
+          ),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(widget.borderRadius),
+            gradient: SweepGradient(
+              startAngle: 0.0,
+              endAngle: 6.28319,
+              transform: GradientRotation(angle),
+              colors: const [
+                Color(0xFF1E88E5), // नीला
+                Color(0xFF00C853), // हरा
+                Color(0xFFFFAB00), // सुनहरा पीला
+                Color(0xFFE53935), // कोरल लाल
+                Color(0xFF8E24AA), // बैंगनी
+                Color(0xFF1E88E5), // वापस नीला
+              ],
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: dynamicGlow,
+                blurRadius: 12,
+                spreadRadius: 0.5,
+                offset: const Offset(0, 3),
+              ),
+            ],
+          ),
+          child: widget.isGradientFill
+              ? widget.child
+              : Container(
+                  decoration: BoxDecoration(
+                    color: widget.innerBackgroundColor,
+                    borderRadius: BorderRadius.circular(
+                      widget.borderRadius - widget.borderWidth,
+                    ),
+                  ),
+                  child: widget.child,
+                ),
+        );
+      },
+    );
+  }
+}
+
+class OrderCancelAndRefundCard extends StatefulWidget {
+  final String orderId;
+  final Map<String, dynamic> data;
+
+  const OrderCancelAndRefundCard({
+    super.key,
+    required this.orderId,
+    required this.data,
+  });
+
+  @override
+  State<OrderCancelAndRefundCard> createState() =>
+      _OrderCancelAndRefundCardState();
+}
+
+class _OrderCancelAndRefundCardState extends State<OrderCancelAndRefundCard> {
+  bool _isCancelling = false;
+
+  Future<void> _confirmAndCancel() async {
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        title: const Text(
+          'Cancel Order?',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        content: const Text(
+          'क्या आप वाकई इस ऑर्डर को कैंसिल करना चाहते हैं?\n\nनोट: ऑर्डर कैंसिल करने पर केवल सामान (Items) की राशि ही आपके मूल बैंक/UPI खाते में 3–5 कार्यदिवसों में रिफंड होगी। Platform, Handling व Packaging फीस नॉन-रिफंडेबल है।',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('नहीं, रहने दें'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFE53935),
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('हाँ, Cancel करें'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    setState(() => _isCancelling = true);
+    try {
+      final result = await _flashCartPaymentWorkerCall(
+        Uri.https(_flashCartPaymentHost, 'cashfreePayment/order/cancel-refund'),
+        {'orderId': widget.orderId, 'reason': 'Cancelled by customer from app'},
+      );
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            result['message']?.toString() ?? 'Order सफलतापूर्वक cancel हो गया।',
+          ),
+          backgroundColor: Colors.green,
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _isCancelling = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rawStatus =
+        widget.data['status']?.toString().trim().toLowerCase() ?? '';
+    final isCancelled = rawStatus == 'cancelled';
+    final nonCancellable = [
+      'out for delivery',
+      'out_for_delivery',
+      'picked_up',
+      'delivered',
+    ];
+
+    if (isCancelled) {
+      final refundStatus =
+          widget.data['refundStatus']?.toString().toLowerCase() ?? 'none';
+      final refundId = widget.data['refundId']?.toString() ?? '';
+      final refundAmount =
+          widget.data['refundAmount'] ?? widget.data['totalPrice'] ?? 0;
+      final isRefunded =
+          refundStatus == 'initiated' || refundStatus == 'processed';
+
+      return Container(
+        padding: const EdgeInsets.all(18),
+        decoration: BoxDecoration(
+          color: isRefunded ? const Color(0xFFE8F5E9) : const Color(0xFFFFEBEE),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: isRefunded ? Colors.green.shade300 : Colors.red.shade200,
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  isRefunded ? Icons.currency_rupee_rounded : Icons.cancel,
+                  color: isRefunded
+                      ? Colors.green.shade700
+                      : Colors.red.shade700,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    isRefunded
+                        ? 'Order Cancelled • Refund Initiated ✓'
+                        : 'Order Cancelled',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: isRefunded
+                          ? Colors.green.shade800
+                          : Colors.red.shade800,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              isRefunded
+                  ? '₹$refundAmount का रिफंड आपके मूल UPI / Bank खाते में भेज दिया गया है। यह 3–5 कार्यदिवसों में आपके खाते में जमा हो जाएगा।'
+                  : 'यह ऑर्डर कैंसिल कर दिया गया है। (Cash on Delivery ऑर्डर होने के कारण कोई ऑनलाइन रिफंड लागू नहीं है।)',
+              style: const TextStyle(fontSize: 13.5, height: 1.45),
+            ),
+            if (isRefunded && refundId.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Refund ID: $refundId',
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.green.shade900,
+                ),
+              ),
+            ],
+          ],
+        ),
+      );
+    }
+
+    if (nonCancellable.contains(rawStatus)) {
+      return const SizedBox.shrink();
+    }
+
+    return SizedBox(
+      width: double.infinity,
+      height: 48,
+      child: OutlinedButton.icon(
+        onPressed: _isCancelling ? null : _confirmAndCancel,
+        style: OutlinedButton.styleFrom(
+          foregroundColor: const Color(0xFFE53935),
+          side: const BorderSide(color: Color(0xFFE53935), width: 1.5),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          backgroundColor: Colors.white,
+        ),
+        icon: _isCancelling
+            ? const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: Color(0xFFE53935),
+                ),
+              )
+            : const Icon(Icons.cancel_outlined),
+        label: Text(
+          _isCancelling ? 'Cancelling & Processing Refund...' : 'Cancel Order',
+          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+        ),
+      ),
+    );
   }
 }
